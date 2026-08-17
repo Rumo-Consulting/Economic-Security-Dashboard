@@ -33,6 +33,11 @@ UNSPECIFIED = "Unspecified Measure"
 TOP_N = 12                      # fixed everywhere, so no "how many to show" control is needed
 CONTEST_FLOOR = 3               # minimum mentions before a measure enters the concern ranking
 
+# The period the dataset was compiled over. This is the search window, which is wider than the
+# first and last dates that happen to appear in the rows — edit it when the coverage extends.
+PERIOD_FROM = "01 Jan 2026"
+PERIOD_TO = "15 Aug 2026"
+
 INK = "#16232E"
 PRIMARY = "#2C5F7C"
 MUTED = "#5F6E78"
@@ -111,18 +116,28 @@ st.markdown(
       @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&display=swap');
 
       html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stSidebar"],
-      .stApp p, .stApp li, .stApp label, .stApp span, .stMarkdown, button, input {{
+      .stApp p, .stApp li, .stApp label, .stMarkdown {{
           font-family: 'IBM Plex Sans', Segoe UI, system-ui, sans-serif;
+      }}
+      /* Streamlit draws expander arrows and dropdown chevrons as Material ligatures.
+         Never let the body font touch them or they render as the literal word. */
+      [data-testid="stIconMaterial"], .material-symbols-rounded, [class*="material-symbols"],
+      [data-testid="stExpanderToggleIcon"] {{
+          font-family: 'Material Symbols Rounded', 'Material Icons' !important;
       }}
       h1, h2, h3, h4 {{ font-family: 'Source Serif 4', Georgia, serif; color: {INK};
                         letter-spacing: -0.01em; }}
-      .block-container {{ padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1280px; }}
+      .block-container {{ padding-top: 3.2rem; padding-bottom: 3rem; max-width: 1280px; }}
 
-      .masthead {{ border-bottom: 2px solid {INK}; padding-bottom: 12px; margin-bottom: 4px; }}
+      .masthead {{ border-bottom: 2px solid {INK}; padding: 6px 0 14px 0; margin-bottom: 4px; }}
       .masthead .eyebrow {{ font-family:'IBM Plex Mono', monospace; font-size:.7rem; font-weight:600;
-                            letter-spacing:.16em; text-transform:uppercase; color:{PRIMARY}; }}
-      .masthead h1 {{ font-size: clamp(1.7rem, 3.4vw, 2.3rem); margin:.15rem 0 .25rem 0; font-weight:700; }}
-      .masthead .sub {{ color:{MUTED}; font-size:1rem; max-width:66ch; }}
+                            letter-spacing:.16em; text-transform:uppercase; color:{PRIMARY};
+                            line-height:1.9; }}
+      .masthead h1 {{ font-size: clamp(1.7rem, 3.4vw, 2.3rem); margin:.1rem 0 .3rem 0;
+                      font-weight:700; line-height:1.25; }}
+      .masthead .sub {{ color:{MUTED}; font-size:1rem; max-width:none; line-height:1.5; }}
+      .masthead .period {{ font-family:'IBM Plex Mono', monospace; font-size:.78rem; color:{MUTED};
+                           margin-top:8px; }}
 
       .strip {{ display:flex; width:100%; height:14px; border-radius:7px; overflow:hidden;
                 margin:18px 0 8px 0; border:1px solid {RULE}; }}
@@ -151,7 +166,7 @@ st.markdown(
                     letter-spacing:.14em; text-transform:uppercase; color:{PRIMARY};
                     display:block; margin-bottom:8px; }}
       .read b {{ color:{INK}; font-weight:600; }}
-      .note {{ font-size:.85rem; color:{MUTED}; margin:-10px 0 30px 0; }}
+      .note {{ font-size:.85rem; color:{MUTED}; margin:4px 0 30px 0; }}
       .lead {{ font-size:.92rem; color:{MUTED}; margin:2px 0 16px 0; }}
 
       section[data-testid="stSidebar"] {{ background:#F7F9FA; border-right:1px solid {RULE}; }}
@@ -295,28 +310,57 @@ def int_axis(fig, maxval):
 
 def hbar(data: pd.DataFrame, title: str, unit: str, color=BAR, height=None):
     data = data.sort_values("count")
-    h = height or max(240, 30 * len(data) + 120)
+    h = height or max(250, 30 * len(data) + 130)
     fig = px.bar(data, x="count", y="label", orientation="h", title=title)
     fig.update_traces(marker_color=color, hovertemplate="%{y}<br>%{x} " + unit + "<extra></extra>")
-    fig.update_layout(height=h, yaxis_title=None, xaxis_title=unit, showlegend=False)
+    fig.update_layout(height=h, yaxis_title=None, xaxis_title=unit, showlegend=False,
+                      margin=dict(t=56, b=56, l=10, r=18))
     return int_axis(fig, data["count"].max() if len(data) else 0)
 
 
 def stance_hbar(data: pd.DataFrame, ycol: str, title: str, unit: str, height=None):
     order = data.groupby(ycol)["count"].sum().sort_values().index.tolist()
-    h = height or max(260, 28 * len(order) + 140)
+    h = height or max(280, 28 * len(order) + 170)
     fig = px.bar(data, x="count", y=ycol, color="Stance", orientation="h", title=title,
                  category_orders={ycol: order, "Stance": STANCE_ORDER},
                  color_discrete_map=STANCE_COLORS)
-    fig.update_layout(height=h, barmode="relative", yaxis_title=None, xaxis_title=unit,
-                      margin=dict(t=56, b=76, l=10, r=18))
+    # The legend sits under the plot, so the x-axis carries no title — it would collide.
+    fig.update_layout(
+        height=h, barmode="relative", yaxis_title=None, xaxis_title=None,
+        margin=dict(t=56, b=96, l=10, r=18),
+        legend=dict(orientation="h", yanchor="top", y=-0.16, xanchor="center", x=0.5,
+                    title_text="", font=dict(size=12)),
+    )
     fig.update_traces(hovertemplate="%{y}<br>%{x} " + unit + "<extra>%{fullData.name}</extra>")
     return int_axis(fig, data.groupby(ycol)["count"].sum().max() if len(data) else 0)
 
 
 def readout(text: str):
-    st.markdown(f"<div class='read'><span class='tag'>What this view shows</span>{text}</div>",
+    st.markdown(f"<div class='read'><span class='tag'>What this tab shows</span>{text}</div>",
                 unsafe_allow_html=True)
+
+
+def records_panel(key: str, data: pd.DataFrame):
+    """The underlying rows, collapsed, at the foot of every tab."""
+    with st.expander(f"See the {len(data)} records behind this view"):
+        search = st.text_input("Search", key=f"q_{key}",
+                               placeholder="Try: rare earths, semiconductors, transparency…")
+        cols = [c for c in ["Date", "Document_Symbol", "Body", "Member", "Stance", "Measure 1",
+                            "Owner", "Security_SubDomain_1", "Interaction_Summary"] if c in data.columns]
+        rows = data[cols].copy()
+        if search:
+            mask = rows.apply(lambda r: search.lower() in " ".join(map(str, r.values)).lower(), axis=1)
+            rows = rows[mask]
+        rows = rows.sort_values("Date", ascending=False)
+        rows["Date"] = pd.to_datetime(rows["Date"]).dt.strftime("%d %b %Y")
+        rows = rows.rename(columns={"Document_Symbol": "Document", "Measure 1": "Measure",
+                                    "Security_SubDomain_1": "Security area",
+                                    "Interaction_Summary": "What was said"})
+        if search:
+            st.caption(f"{len(rows)} of {len(data)} records match “{search}”.")
+        st.dataframe(rows, width="stretch", hide_index=True, height=380)
+        st.download_button("Download these records (CSV)", data.to_csv(index=False),
+                           "interactions.csv", "text/csv", key=f"dl_records_{key}")
 
 
 def lead(text: str):
@@ -395,18 +439,23 @@ COVER_FROM, COVER_TO = df["Date"].min(), df["Date"].max()
 st.sidebar.header("Filters")
 st.sidebar.caption("Leave a filter empty to include everything. Filters apply to every tab.")
 
-f_body = st.sidebar.multiselect("WTO body", sorted(df["Body"].dropna().unique()))
-f_member = st.sidebar.multiselect("Member speaking", sorted(df["Member"].dropna().unique()))
-f_stance = st.sidebar.multiselect("How they engaged", [s for s in STANCE_ORDER if s in set(df["Stance"].dropna())])
-f_area = st.sidebar.multiselect("Security area", sorted(areas_long(df)["Area"].unique()))
+FILTER_KEYS = ["f_body", "f_member", "f_stance", "f_area", "f_group", "f_owner", "f_core", "f_dates"]
+
+f_body = st.sidebar.multiselect("WTO body", sorted(df["Body"].dropna().unique()), key="f_body")
+f_member = st.sidebar.multiselect("Member speaking", sorted(df["Member"].dropna().unique()), key="f_member")
+f_stance = st.sidebar.multiselect("How they engaged",
+                                  [s for s in STANCE_ORDER if s in set(df["Stance"].dropna())],
+                                  key="f_stance")
+f_area = st.sidebar.multiselect("Security area", sorted(areas_long(df)["Area"].unique()), key="f_area")
 
 with st.sidebar.expander("More filters"):
-    f_group = st.multiselect("Measure family", sorted(measures_long(df)["Measure_Group"].unique()))
-    f_owner = st.multiselect("Measure owner", sorted(df["Owner"].dropna().unique()),
+    f_group = st.multiselect("Measure family", sorted(measures_long(df)["Measure_Group"].unique()),
+                             key="f_group")
+    f_owner = st.multiselect("Measure owner", sorted(df["Owner"].dropna().unique()), key="f_owner",
                              help="The member whose measure is under discussion — not the speaker.")
-    core_only = st.toggle("Only records where security is the core issue", value=False)
+    core_only = st.toggle("Only records where security is the core issue", value=False, key="f_core")
     picked = st.date_input("Date range", value=(COVER_FROM.date(), COVER_TO.date()),
-                           min_value=COVER_FROM.date(), max_value=COVER_TO.date())
+                           min_value=COVER_FROM.date(), max_value=COVER_TO.date(), key="f_dates")
     if isinstance(picked, (list, tuple)):
         d_from = picked[0] if picked else COVER_FROM.date()
         d_to = picked[1] if len(picked) > 1 else COVER_TO.date()
@@ -435,7 +484,10 @@ filtered = filtered[(filtered["Date"] >= pd.Timestamp(d_from)) & (filtered["Date
 st.sidebar.markdown("---")
 st.sidebar.metric("Records in view", f"{len(filtered)} / {len(df)}")
 if st.sidebar.button("Reset filters", width="stretch", key="reset"):
-    st.session_state.clear()
+    # Deleting the widget keys (rather than clearing all of session_state) is what actually
+    # returns a multiselect to empty — Streamlit re-creates it at its default on the rerun.
+    for k in FILTER_KEYS:
+        st.session_state.pop(k, None)
     st.rerun()
 
 # ======================================================================================
@@ -446,46 +498,45 @@ st.markdown(
     <div class="masthead">
       <div class="eyebrow">WTO discussion analytics</div>
       <h1>Trade Governance Lab</h1>
-      <div class="sub">What WTO members say to each other about {DOMAIN.lower()}, and how they
-      say it. {len(df)} recorded interventions, {COVER_FROM:%b %Y}–{COVER_TO:%b %Y}.</div>
+      <div class="sub">How WTO members raise, defend and contest {DOMAIN.lower()} measures in the
+      organisation's formal meetings.</div>
+      <div class="period">Data period: {PERIOD_FROM} to {PERIOD_TO}</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-with st.expander("New here? How to read this dashboard"):
-    st.markdown(
-        """
-- **One record = one intervention** — a single member speaking once on a single agenda item.
-- **Each tab answers one question.** *Overview* — what is in the data. *Members* — who speaks.
-  *Measures* — what is discussed. *Arguments* — the grounds they argue on. *Records* — the
-  underlying rows.
-- **The four colours never change their meaning:** ochre is a concern being raised, teal is a
-  member defending or explaining a measure, olive is a proposal, grey is a general statement.
-- **Filters are on the left** and apply everywhere. The summary box at the top of each tab is
-  written from whatever is currently in view.
-        """
-    )
-
 if filtered.empty:
     st.warning("Nothing matches these filters. Use **Reset filters** on the left.")
     st.stop()
-
-stance_strip(filtered)
 
 M = measures_long(filtered)
 A = areas_long(filtered)
 T = topics_long(filtered)
 NAMED = M[M["Measure"] != UNSPECIFIED]
 
-tab_over, tab_mem, tab_meas, tab_args, tab_rows = st.tabs(
-    ["Overview", "Members", "Measures", "Arguments", "Records"]
+tab_over, tab_mem, tab_meas, tab_args, tab_data = st.tabs(
+    ["Overview", "Members", "Measures", "Arguments", "Data & method"]
 )
 
 # ======================================================================================
 # OVERVIEW — what is in the data
 # ======================================================================================
 with tab_over:
+    with st.expander("New here? How to read this dashboard"):
+        st.markdown(
+            """
+- **One record = one intervention** — a single member speaking once on a single agenda item.
+- **Each tab answers one question.** *Overview* — what is in the data. *Members* — who speaks.
+  *Measures* — what is discussed. *Arguments* — the grounds they argue on. *Data & method* — how
+  the dataset was built.
+- **The four colours never change their meaning:** ochre is a concern being raised, teal is a
+  member defending or explaining a measure, olive is a proposal, grey is a general statement.
+- **Filters are on the left** and apply everywhere. Every tab opens with a summary written from
+  whatever is currently in view, and closes with the records behind it.
+            """
+        )
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Interventions", len(filtered))
     c2.metric("Members", filtered["Member"].nunique())
@@ -503,12 +554,18 @@ with tab_over:
         f"({pcs(n_body, len(filtered))}).{concentration_note(filtered)}{small_n(filtered)}"
     )
 
+    st.markdown("##### How members engaged")
+    stance_strip(filtered)
+    note("These four colours mean the same thing in every chart across the dashboard.")
+
     area_stance = A.groupby(["Area", "Stance"]).size().reset_index(name="count")
     show(stance_hbar(area_stance, "Area", "Which security areas come up most?", "interventions"),
          "ov_area")
     note("An intervention can touch two areas, so the bars add up to more than the record count.")
 
     show(hbar(vc(filtered["Body"]), "Where does the discussion happen?", "interventions"), "ov_body")
+
+    records_panel("over", filtered)
 
 # ======================================================================================
 # MEMBERS — who speaks
@@ -559,6 +616,8 @@ with tab_mem:
              f"which are left out of this chart.")
     else:
         note("Too few records here name whose measure is being discussed to show the pairings.")
+
+    records_panel("mem", filtered)
 
 # ======================================================================================
 # MEASURES — what is discussed
@@ -635,6 +694,8 @@ with tab_meas:
         st.download_button("Download this table (CSV)", ref.to_csv(index=False),
                            "measure_summary.csv", "text/csv", key="dl_meas")
 
+    records_panel("meas", filtered)
+
 # ======================================================================================
 # ARGUMENTS — the grounds members argue on
 # ======================================================================================
@@ -650,43 +711,25 @@ with tab_args:
             f"The most common ground of argument is <b>{t_counts.index[0]}</b> "
             f"({int(t_counts.iloc[0])} interventions). "
             f"<b>{legal}</b> interventions ({pcs(legal, len(filtered))}) argue at least partly in legal "
-            f"terms — whether a measure is WTO-consistent, transparent or procedurally fair. "
-            f"Members usually make more than one kind of argument at once, averaging "
-            f"<b>{T.groupby('Row_ID').size().mean():.1f}</b> grounds per intervention.{small_n(filtered)}"
+            f"terms — whether a measure is WTO-consistent, transparent or procedurally "
+            f"fair.{small_n(filtered)}"
         )
 
         show(stance_hbar(T.groupby(["Topic", "Stance"]).size().reset_index(name="count"),
                          "Topic", "What grounds do members argue on?", "interventions"), "arg_topic")
+        note("A member usually argues on more than one ground at once, so an intervention can "
+             "appear in several bars.")
 
-        show(hbar(vc(T["Dimension"]), "Grouped into broad dimensions", "interventions", height=300),
+        show(hbar(vc(T["Dimension"]), "Grouped into broad dimensions", "interventions", height=320),
              "arg_dim")
 
-# ======================================================================================
-# RECORDS — the underlying rows, plus method
-# ======================================================================================
-with tab_rows:
-    lead("Every intervention behind the charts. Search it, read it, download it.")
+    records_panel("args", filtered)
 
-    search = st.text_input("Search", key="q",
-                           placeholder="Try: rare earths, semiconductors, transparency…")
-    cols = [c for c in ["Date", "Document_Symbol", "Body", "Member", "Stance", "Measure 1",
-                        "Owner", "Security_SubDomain_1", "Interaction_Summary"] if c in filtered.columns]
-    rows = filtered[cols].copy()
-    if search:
-        mask = rows.apply(lambda r: search.lower() in " ".join(map(str, r.values)).lower(), axis=1)
-        rows = rows[mask]
-    rows = rows.sort_values("Date", ascending=False)
-    rows["Date"] = pd.to_datetime(rows["Date"]).dt.strftime("%d %b %Y")
-    rows = rows.rename(columns={"Document_Symbol": "Document", "Measure 1": "Measure",
-                                "Security_SubDomain_1": "Security area",
-                                "Interaction_Summary": "What was said"})
-    st.caption(f"{len(rows)} record{'s' if len(rows) != 1 else ''}.")
-    st.dataframe(rows, width="stretch", hide_index=True, height=420)
-    st.download_button("Download these records (CSV)", filtered.to_csv(index=False),
-                       "interactions.csv", "text/csv", key="dl_rows")
-
-    st.markdown("---")
-    st.markdown("#### About the data")
+# ======================================================================================
+# DATA & METHOD — how the dataset was built
+# ======================================================================================
+with tab_data:
+    lead("Where the records come from, what the terms mean, and how much to trust them.")
 
     if not vocab.empty:
         with st.expander("What the terms mean"):
@@ -712,11 +755,11 @@ with tab_rows:
             fig = px.pie(conf, names="label", values="count", hole=.55, title="Coder confidence",
                          color="label",
                          color_discrete_map={"High": "#5C8A4A", "Medium": "#B0894A", "Low": CONCERN})
-            fig.update_layout(height=280)
+            fig.update_layout(height=300, margin=dict(t=56, b=20, l=10, r=10))
             show(fig, "q_conf", q1)
         if "Security_Relevance" in filtered.columns:
             core = int((filtered["Security_Relevance"] == "Core").sum())
-            q2.metric("Security is the core issue", f"{pcs(core, len(filtered))}",
+            q2.metric("Security is the core issue", pcs(core, len(filtered)),
                       help="The rest touch on security as context rather than as the point of the "
                            "intervention. Filter to Core-only under More filters.")
             q2.caption(f"{core} of {len(filtered)} records in view.")
@@ -724,6 +767,8 @@ with tab_rows:
     if not issues.empty:
         with st.expander(f"Known issues in the dataset ({len(issues)})"):
             st.dataframe(issues, width="stretch", hide_index=True, height=300)
+
+    records_panel("data", filtered)
 
 st.markdown(
     f"<div class='note' style='margin-top:26px;border-top:1px solid {RULE};padding-top:10px;'>"
