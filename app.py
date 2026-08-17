@@ -1,145 +1,298 @@
 """
-Trade Governance Lab — WTO discussion analytics dashboard.
+Trade Governance Lab — National & Economic Security in the WTO.
 
-This revision:
-- Per-tab focus filters are multiselect and default to "all" (leave empty = everything).
-- Metric ribbons hide any dimension that collapses to a single value (no more useless "1 Member").
-- Softer, eye-friendly chart palette; bright purple reserved for titles/headings only.
-- Title and sub-title centred; sub-title reworded and resized.
-- Hierarchy treemaps replaced with clean colour-grouped bars (simpler, readable on mobile).
-- Plotly modebar hidden so the chart toolbar no longer overlaps titles on phones.
-- Axis labels protected from clipping (horizontal orientation + auto-margins).
-- "Over time" charts gated behind SHOW_TIME_CHARTS — flip on once multi-year data exists.
+Reads Database_v21.xlsx (sheets: Database, Vocabularies, Issues_Log) and presents five tabs:
+Overview · Members · Measures · Framing · Data & method.
 
-The "AI Summary" boxes are generated deterministically from the data in the current view
-(no API key needed) and update live with the filters. Swap the narrate text for a real LLM
-call later if desired.
+Design notes
+------------
+* Stance is the colour language of the whole dashboard: Apprehension (ochre),
+  Defence/Explanation (teal), Proposal/Recommendation (olive), General Statement (slate).
+  The same four colours mean the same four things in every chart, so a reader learns the
+  key once.
+* Measure grouping is done in the app (see MEASURE_GROUPS) rather than in the workbook.
+  The full mapping is shown and downloadable on the "Data & method" tab; if a
+  "Measure_Group" column is ever added to the workbook it takes precedence automatically.
+* Summaries are computed deterministically from the rows in view — no API key, no network
+  call, and they cannot state a number the data does not contain.
+* Counting: a row is one interaction (one member, one intervention). Measures, security
+  sub-domains and governance topics are multi-valued, so charts built on them count
+  *mentions* and are labelled as such.
 """
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import plotly.io as pio
 import streamlit as st
 
-# --------------------------------------------------------------------------------------
-# Config / theming
-# --------------------------------------------------------------------------------------
-st.set_page_config(page_title="Trade Governance Lab", page_icon="🌐", layout="wide")
+# ======================================================================================
+# Config and theme
+# ======================================================================================
+st.set_page_config(page_title="Trade Governance Lab", page_icon="🛡️", layout="wide")
 
-SHOW_TIME_CHARTS = False          # turn on when more than one year of data is available
-NO_MEASURE = "No Specific Measure"
+SHOW_TIME_CHARTS = False          # seven months of event-driven data will not carry a trend
+UNSPECIFIED = "Unspecified Measure"
 
-# Deep ocean-blue: titles, headings, accents (replaces the previous jarring magenta).
-PRIMARY = "#1F5A7A"
-HEADING = "#234E63"
-# Charts: muted, harmonious palette that is easy on the eye.
-CHART = "#5B8DA6"                 # single-series bars / heatmap accent (soft steel-blue)
-PALETTE = ["#5B8DA6", "#E0A458", "#7FB685", "#9D8EC4", "#5BA8A0", "#C98BB9", "#8C9EC4", "#D4B483"]
-HEAT_SCALE = ["#F4F7F9", "#BBD0DC", "#7FA9C0", "#4E7E9C", "#2E5C78"]
+INK = "#16232E"          # headings, display type
+PRIMARY = "#2C5F7C"      # accents, links, metric values
+MUTED = "#5F6E78"        # secondary text
+RULE = "#DBE2E6"         # hairlines
+BAR = "#4A7E9B"          # neutral single-series bars
 
-# WTO bodies shown by their full names (no bracketed codes, "Committee" spelled out).
-FORUM_NAMES = {
-    "GC": "GC",
+# Stance carries meaning, so it carries colour.
+STANCE_ORDER = ["Apprehension", "Defence/Explanation", "Proposal/Recommendation", "General Statement"]
+STANCE_COLORS = {
+    "Apprehension": "#C1662F",
+    "Defence/Explanation": "#2F7E8C",
+    "Proposal/Recommendation": "#5C8A4A",
+    "General Statement": "#8B99A6",
+}
+CAT_PALETTE = ["#2C5F7C", "#C1662F", "#5C8A4A", "#8B6BA8", "#2F7E8C", "#B0894A", "#8B99A6", "#9B5B6B"]
+HEAT_SCALE = ["#F5F7F8", "#CBDBE3", "#93B8C9", "#5A8FA8", "#2C5F7C"]
+
+PCONF = {"displayModeBar": False, "responsive": True}
+
+FORUM_SHORT = {
+    "General Council": "GC",
     "CTG": "CTG",
-    "CTD": "CTD",
-    "CTE": "CTE",
-    "CTF": "CTF",
+    "CMA": "CMA",
+    "SCM Committee": "SCM",
+    "TBT Committee": "TBT",
+    "TRIMS Committee": "TRIMS",
+    "Council for TRIPS / WGTTT": "TRIPS/WGTTT",
+}
+FORUM_FULL = {
+    "GC": "General Council",
+    "CTG": "Council for Trade in Goods",
+    "CMA": "Committee on Market Access",
+    "SCM": "Committee on Subsidies and Countervailing Measures",
+    "TBT": "Committee on Technical Barriers to Trade",
+    "TRIMS": "Committee on Trade-Related Investment Measures",
+    "TRIPS/WGTTT": "Council for TRIPS / Working Group on Trade and Transfer of Technology",
+}
+MEMBER_SHORT = {
+    "Bolivarian Republic of Venezuela": "Venezuela",
+    "Russian Federation": "Russia",
+    "Republic of Korea": "Korea, Rep. of",
+    "Gambia (on behalf of the LDC Group)": "Gambia (LDC Group)",
+    "Mozambique (on behalf of the African Group)": "Mozambique (African Group)",
 }
 
-PCONF = {"displayModeBar": False, "responsive": True}   # hide plotly toolbar → no title overlap
+# ---- Measure grouping rules (ordered; first match wins) -------------------------------
+MEASURE_GROUPS: list[tuple[str, list[str]]] = [
+    ("Sanctions & coercive measures",
+     [r"sanction", r"coercive", r"russia", r"oil price cap", r"secondary tariffs", r"restrictive measures"]),
+    ("Export controls & restrictions",
+     [r"export control", r"export restriction", r"export permit", r"entity list", r"dual-use",
+      r"rare earth", r"critical raw material", r"critical mineral", r"downstream processing"]),
+    ("Tariffs & trade remedies",
+     [r"tariff", r"section 232", r"section 301", r"surtax", r"trq", r"customs", r"countervailing",
+      r"\bcvd\b", r"steel trade measures", r"steel import"]),
+    ("Industrial policy & subsidies",
+     [r"chips", r"\bact\b", r"subsid", r"overcapacity", r"local content", r"made in", r"golden share",
+      r"guardrail", r"decree", r"\bfund\b", r"support for food", r"accelerator", r"net-zero"]),
+    ("Digital, data & technology",
+     [r"encryption", r"cryptograph", r"cybersecurity", r"e-commerce", r"semiconductor"]),
+    ("Green & environmental conditions",
+     [r"eudr", r"green protectionist", r"photovoltaic"]),
+    ("General / unspecified",
+     [r"^unspecified", r"^unilateral measures$", r"^tariff and non-tariff"]),
+]
 
-# Shared plotly template.
 pio.templates["tgl"] = pio.templates["plotly_white"]
 pio.templates["tgl"].layout.update(
-    colorway=PALETTE,
-    font=dict(family="Inter, Segoe UI, system-ui, sans-serif", size=13, color="#33384a"),
-    margin=dict(l=12, r=18, t=54, b=14),
-    title=dict(font=dict(size=15, color="#2b2740"), x=0, xanchor="left"),
-    xaxis=dict(automargin=True),
-    yaxis=dict(automargin=True),
-    legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5, title_text=""),
+    colorway=CAT_PALETTE,
+    font=dict(family="IBM Plex Sans, Segoe UI, system-ui, sans-serif", size=13, color="#3A464F"),
+    margin=dict(l=10, r=18, t=52, b=16),
+    title=dict(font=dict(family="Source Serif 4, Georgia, serif", size=16, color=INK), x=0, xanchor="left"),
+    xaxis=dict(automargin=True, gridcolor="#EDF1F3", zerolinecolor="#EDF1F3"),
+    yaxis=dict(automargin=True, gridcolor="#EDF1F3", zerolinecolor="#EDF1F3"),
+    legend=dict(orientation="h", yanchor="top", y=-0.14, xanchor="center", x=0.5, title_text=""),
 )
 pio.templates.default = "tgl"
 
 st.markdown(
     f"""
     <style>
-      .block-container {{ padding-top: 2.4rem; padding-bottom: 2rem; max-width: 1500px; }}
-      h1,h2,h3,h4 {{ color: {HEADING}; }}
-      .app-title {{ text-align:center; color:{PRIMARY}; font-weight:700; width:100%;
-                    font-size: clamp(1.6rem, 3.6vw, 2.3rem); line-height:1.5;
-                    margin: 0 0 4px 0; padding: 8px 6px 2px 6px; overflow:visible; }}
-      .app-sub {{ text-align:center; color:#6b6680; font-size: clamp(.92rem, 1.8vw, 1.05rem);
-                  font-weight:400; margin: 0 auto 18px auto; max-width: 760px; padding: 0 6px; }}
-      .stTabs [data-baseweb="tab-list"] {{ gap: 4px; flex-wrap: wrap; justify-content:center; }}
-      .stTabs [data-baseweb="tab"] {{ font-weight:600; padding:8px 16px; border-radius:10px 10px 0 0; }}
-      .stTabs [aria-selected="true"] {{ background:{PRIMARY}12; color:{PRIMARY};
+      @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&display=swap');
+
+      html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stSidebar"],
+      .stApp p, .stApp li, .stApp label, .stApp span, .stMarkdown, .stCaption, button, input {{
+          font-family: 'IBM Plex Sans', Segoe UI, system-ui, sans-serif;
+      }}
+      h1, h2, h3, h4 {{ font-family: 'Source Serif 4', Georgia, serif; color: {INK}; letter-spacing: -0.01em; }}
+      .block-container {{ padding-top: 2.2rem; padding-bottom: 2.5rem; max-width: 1480px; }}
+
+      .masthead {{ border-bottom: 2px solid {INK}; padding-bottom: 10px; margin-bottom: 6px; }}
+      .masthead .eyebrow {{ font-family:'IBM Plex Mono', monospace; font-size:.7rem; font-weight:600;
+                            letter-spacing:.16em; text-transform:uppercase; color:{PRIMARY}; }}
+      .masthead h1 {{ font-size: clamp(1.7rem, 3.4vw, 2.35rem); margin:.15rem 0 .2rem 0; font-weight:700; }}
+      .masthead .sub {{ color:{MUTED}; font-size:.98rem; max-width:70ch; margin-bottom:.35rem; }}
+      .masthead .meta {{ font-family:'IBM Plex Mono', monospace; font-size:.74rem; color:{MUTED};
+                         letter-spacing:.02em; }}
+
+      /* Stance strip — the composition of the current view, always visible */
+      .strip {{ display:flex; width:100%; height:12px; border-radius:6px; overflow:hidden;
+                margin:14px 0 6px 0; border:1px solid {RULE}; }}
+      .strip div {{ height:100%; }}
+      .strip-key {{ font-family:'IBM Plex Mono', monospace; font-size:.72rem; color:{MUTED};
+                    display:flex; flex-wrap:wrap; gap:14px; margin-bottom:16px; }}
+      .strip-key span b {{ font-weight:600; color:{INK}; }}
+      .dot {{ display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:5px; }}
+
+      div[data-testid="stMetricValue"] {{ font-family:'IBM Plex Mono', monospace;
+                                          color:{PRIMARY}; font-size:1.55rem; }}
+      div[data-testid="stMetricLabel"] p {{ font-size:.76rem; letter-spacing:.05em;
+                                            text-transform:uppercase; color:{MUTED}; }}
+
+      .stTabs [data-baseweb="tab-list"] {{ gap:2px; flex-wrap:wrap; border-bottom:1px solid {RULE}; }}
+      .stTabs [data-baseweb="tab"] {{ font-weight:600; font-size:.92rem; padding:9px 18px;
+                                      border-radius:8px 8px 0 0; color:{MUTED}; }}
+      .stTabs [aria-selected="true"] {{ background:{PRIMARY}0F; color:{PRIMARY};
                                         border-bottom:3px solid {PRIMARY}; }}
-      div[data-testid="stMetricValue"] {{ color:{PRIMARY}; font-size:1.6rem; }}
-      .ai-box {{ background: linear-gradient(135deg,{PRIMARY}0D,{PRIMARY}04);
-                 border:1px solid {PRIMARY}2E; border-left:5px solid {PRIMARY};
-                 border-radius:12px; padding:14px 18px; margin:6px 0 18px 0;
-                 font-size:.96rem; line-height:1.55; }}
-      .ai-box .tag {{ display:inline-block; font-size:.7rem; font-weight:700; letter-spacing:.06em;
-                      text-transform:uppercase; color:{PRIMARY}; margin-bottom:6px; }}
+
+      .read {{ background:#FFFFFF; border:1px solid {RULE}; border-left:4px solid {PRIMARY};
+               border-radius:4px; padding:14px 18px; margin:4px 0 20px 0;
+               font-size:.95rem; line-height:1.6; color:#2B3740; }}
+      .read .tag {{ font-family:'IBM Plex Mono', monospace; font-size:.68rem; font-weight:600;
+                    letter-spacing:.14em; text-transform:uppercase; color:{PRIMARY};
+                    display:block; margin-bottom:7px; }}
+      .read b {{ color:{INK}; font-weight:600; }}
+      .note {{ font-size:.82rem; color:{MUTED}; margin:-6px 0 14px 0; }}
+
+      section[data-testid="stSidebar"] {{ background:#F7F9FA; border-right:1px solid {RULE}; }}
+      section[data-testid="stSidebar"] h2 {{ font-size:1.05rem; }}
+
       @media (max-width: 640px) {{
-          .block-container {{ padding-left:.6rem; padding-right:.6rem; }}
-          div[data-testid="stMetricValue"] {{ font-size:1.2rem; }}
+          .block-container {{ padding-left:.7rem; padding-right:.7rem; }}
+          div[data-testid="stMetricValue"] {{ font-size:1.15rem; }}
       }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# --------------------------------------------------------------------------------------
+
+# ======================================================================================
 # Data
-# --------------------------------------------------------------------------------------
-@st.cache_data
-def load_data():
-    df = pd.read_excel("WTO_Database.xlsx", sheet_name="Database")
+# ======================================================================================
+CANDIDATE_FILES = ["Database_v21.xlsx", "Database.xlsx", "WTO_Database.xlsx"]
+
+
+def find_workbook() -> Path | None:
+    here = Path(__file__).parent
+    for name in CANDIDATE_FILES:
+        p = here / name
+        if p.exists():
+            return p
+    matches = sorted(here.glob("Database*.xlsx"))
+    return matches[-1] if matches else None
+
+
+def group_measure(name: str) -> str:
+    """Fold near-duplicate measure labels into families. First matching rule wins."""
+    if not isinstance(name, str) or not name.strip():
+        return "General / unspecified"
+    low = name.lower()
+    for group, patterns in MEASURE_GROUPS:
+        if any(re.search(p, low) for p in patterns):
+            return group
+    return "Other measures"
+
+
+@st.cache_data(show_spinner=False)
+def load_data(path_str: str, mtime: float):
+    """mtime busts the cache when the workbook is replaced."""
+    xl = pd.ExcelFile(path_str)
+    df = pd.read_excel(xl, sheet_name="Database")
     df.columns = df.columns.str.strip()
+
+    vocab = pd.read_excel(xl, sheet_name="Vocabularies") if "Vocabularies" in xl.sheet_names else pd.DataFrame()
+    issues = pd.read_excel(xl, sheet_name="Issues_Log") if "Issues_Log" in xl.sheet_names else pd.DataFrame()
+
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["Month"] = df["Date"].dt.to_period("M").dt.to_timestamp()
-    return df
+    df["Row_ID"] = range(len(df))
+    df["Forum"] = df["WTO_Forum"].map(FORUM_SHORT).fillna(df["WTO_Forum"])
+    df["Member"] = df["Participant"].map(MEMBER_SHORT).fillna(df["Participant"])
+    df["Owner"] = df["Measure_Owner"].map(MEMBER_SHORT).fillna(df["Measure_Owner"])
+    for col in ["Stance", "Security_Relevance", "Confidence"]:
+        if col in df.columns:
+            df[col] = df[col].astype("string").str.strip()
+
+    # Inclusion rules R1..R7 as flags, for the method tab.
+    rules = df.get("Inclusion_Rule", pd.Series([""] * len(df))).fillna("").astype(str)
+    df["Rule_Codes"] = rules.apply(lambda s: sorted(set(re.findall(r"R\d", s))))
+
+    return df, vocab, issues
 
 
-def add_forum_labels(df):
-    # Done OUTSIDE the cached loader so edits to FORUM_NAMES take effect immediately
-    # (st.cache_data does not track changes to module-level globals used inside it).
-    df = df.copy()
-    df["Forum"] = df["WTO_Forum"].map(FORUM_NAMES).fillna(df["WTO_Forum"])
-    return df
-
-
-def melt_pairs(data, base, n, names=("Dimension", "Topic")):
-    keep = [c for c in ["Participant", "Forum", "Domain Family", "Governance function"] if c in data.columns]
+def measures_long(d: pd.DataFrame) -> pd.DataFrame:
+    """One row per (interaction, measure). Counts here are mentions, not interactions."""
+    keep = ["Row_ID", "Member", "Owner", "Forum", "Stance", "Date", "Document_Symbol"]
     parts = []
-    for i in range(1, n + 1):
-        a, b = f"{base[0]} {i}", f"{base[1]} {i}"
-        if a in data.columns and b in data.columns:
-            sub = data[[*keep, a, b]].copy()
-            sub.columns = [*keep, names[0], names[1]]
-            parts.append(sub)
+    for col in ["Measure 1", "Measure 2", "Measure 3"]:
+        if col not in d.columns:
+            continue
+        sub = d[keep].copy()
+        sub["Measure"] = d[col].astype("string").str.strip()
+        parts.append(sub)
     if not parts:
-        return pd.DataFrame(columns=[*keep, *names])
-    return pd.concat(parts, ignore_index=True).dropna(subset=[names[0]])
+        return pd.DataFrame(columns=keep + ["Measure", "Measure_Group"])
+    out = pd.concat(parts, ignore_index=True).dropna(subset=["Measure"])
+    out = out[out["Measure"] != ""]
+    if "Measure_Group" in d.columns:                      # workbook column wins if it appears later
+        lookup = d.set_index("Row_ID")["Measure_Group"]
+        out["Measure_Group"] = out["Row_ID"].map(lookup).fillna(out["Measure"].map(group_measure))
+    else:
+        out["Measure_Group"] = out["Measure"].map(group_measure)
+    return out.drop_duplicates(subset=["Row_ID", "Measure"]).reset_index(drop=True)
 
 
-def melt_subdomains(data):
-    keep = [c for c in ["Participant", "Forum", "Domain Family", "Governance function"] if c in data.columns]
+def subdomains_long(d: pd.DataFrame) -> pd.DataFrame:
+    keep = ["Row_ID", "Member", "Forum", "Stance", "Owner"]
     parts = []
-    for i in range(1, 4):
-        col = f"Sub-Domain {i}"
-        if col in data.columns:
-            sub = data[[*keep, col]].copy()
-            sub.columns = [*keep, "Sub-Domain"]
-            parts.append(sub)
+    for col, rank in [("Security_SubDomain_1", "Primary"), ("Security_SubDomain_2", "Secondary")]:
+        if col not in d.columns:
+            continue
+        sub = d[keep].copy()
+        sub["SubDomain"] = d[col].astype("string").str.strip()
+        sub["Rank"] = rank
+        parts.append(sub)
     if not parts:
-        return pd.DataFrame(columns=[*keep, "Sub-Domain"])
-    return pd.concat(parts, ignore_index=True).dropna(subset=["Sub-Domain"])
+        return pd.DataFrame(columns=keep + ["SubDomain", "Rank"])
+    out = pd.concat(parts, ignore_index=True).dropna(subset=["SubDomain"])
+    out = out[out["SubDomain"] != ""].drop_duplicates(subset=["Row_ID", "SubDomain"])
+    return out.reset_index(drop=True)
 
 
-def vc(series, top=None):
+def topics_long(d: pd.DataFrame) -> pd.DataFrame:
+    col = "Governance_Dimensions_Topics"
+    keep = ["Row_ID", "Member", "Forum", "Stance"]
+    if col not in d.columns:
+        return pd.DataFrame(columns=keep + ["Dimension", "Topic", "Full_Topic"])
+    sub = d[keep + [col]].copy()
+    sub[col] = sub[col].astype("string")
+    sub = sub.dropna(subset=[col])
+    sub["Full_Topic"] = sub[col].str.split("|")
+    out = sub.explode("Full_Topic")
+    out["Full_Topic"] = out["Full_Topic"].str.strip()
+    out = out[out["Full_Topic"].str.len() > 0]
+    split = out["Full_Topic"].str.split(":", n=1, expand=True)
+    out["Dimension"] = split[0].str.strip()
+    out["Topic"] = split[1].str.strip() if split.shape[1] > 1 else split[0].str.strip()
+    out = out.drop(columns=[col]).drop_duplicates(subset=["Row_ID", "Full_Topic"])
+    return out.reset_index(drop=True)
+
+
+# ======================================================================================
+# Small helpers
+# ======================================================================================
+def vc(series: pd.Series, top: int | None = None) -> pd.DataFrame:
     out = series.dropna().value_counts()
     if top:
         out = out.head(top)
@@ -148,573 +301,607 @@ def vc(series, top=None):
     return out
 
 
-def pct(part, whole):
-    return 0 if not whole else round(part / whole * 100, 1)
+def pct(part: int, whole: int) -> float:
+    return 0.0 if not whole else round(part / whole * 100, 1)
 
 
-# --------------------------------------------------------------------------------------
-# Chart helpers
-# --------------------------------------------------------------------------------------
-def show(container, fig, key):
-    container.plotly_chart(fig, width="stretch", config=PCONF, key=key)
+def pcs(part: int, whole: int) -> str:
+    """Percentage as display text — 54.5%, but 100% rather than 100.0%."""
+    return f"{pct(part, whole):g}%"
 
 
-def int_axis(fig, maxval, axis="x"):
-    """Force whole-number ticks on a count axis (interaction counts are never fractional)."""
+def show(fig, key: str, container=None):
+    target = container or st
+    target.plotly_chart(fig, width="stretch", config=PCONF, key=key)
+
+
+def int_axis(fig, maxval, axis: str = "x"):
     upd = fig.update_xaxes if axis == "x" else fig.update_yaxes
-    if maxval is None or maxval <= 1:
+    if not maxval or maxval <= 1:
         upd(tickformat="d", dtick=1, rangemode="tozero")
     elif maxval <= 10:
         upd(tickformat="d", dtick=1)
     else:
-        upd(tickformat="d")           # auto ticks already land on integers for larger ranges
+        upd(tickformat="d")
     return fig
 
 
-def hbar(data, title, height=None):
-    """Single-series horizontal bar, biggest on top, muted colour."""
+def hbar(data: pd.DataFrame, title: str, xlabel: str = "", height: int | None = None):
     data = data.sort_values("count")
-    h = height or max(220, 34 * len(data) + 90)
+    h = height or max(230, 30 * len(data) + 110)
     fig = px.bar(data, x="count", y="label", orientation="h", title=title)
-    fig.update_traces(marker_color=CHART)
-    fig.update_layout(height=h, yaxis_title=None, xaxis_title=None, showlegend=False)
+    fig.update_traces(marker_color=BAR, hovertemplate="%{y}: %{x}<extra></extra>")
+    fig.update_layout(height=h, yaxis_title=None, xaxis_title=xlabel or None, showlegend=False)
     int_axis(fig, data["count"].max() if len(data) else 0)
     return fig
 
 
-def grouped_hbar(data, ycol, color, title, top=15, height=None):
-    """Horizontal bar coloured by a parent category — replaces the hierarchy treemaps."""
-    data = data.sort_values("count").tail(top)
-    h = height or max(260, 30 * len(data) + 120)
-    fig = px.bar(data, x="count", y=ycol, color=color, orientation="h",
-                 title=title, color_discrete_sequence=PALETTE)
-    fig.update_layout(height=h, yaxis_title=None, xaxis_title=None, barmode="stack",
-                      legend_title_text="", margin=dict(t=50, b=80, l=10, r=18),
-                      legend=dict(orientation="h", yanchor="top", y=-0.12, x=0.5, xanchor="center"))
-    totals = data.groupby(ycol)["count"].sum().max() if len(data) else 0
-    int_axis(fig, totals)
+def stance_hbar(data: pd.DataFrame, ycol: str, title: str, normalise: bool = False,
+                height: int | None = None, xlabel: str = ""):
+    """Horizontal bars split by stance. `data` needs columns [ycol, 'Stance', 'count']."""
+    order = data.groupby(ycol)["count"].sum().sort_values().index.tolist()
+    h = height or max(250, 28 * len(order) + 130)
+    fig = px.bar(
+        data, x="count", y=ycol, color="Stance", orientation="h", title=title,
+        category_orders={ycol: order, "Stance": STANCE_ORDER},
+        color_discrete_map=STANCE_COLORS,
+    )
+    fig.update_layout(height=h, barmode="relative", yaxis_title=None,
+                      xaxis_title=xlabel or None, margin=dict(t=52, b=70, l=10, r=18))
+    if normalise:
+        fig.update_layout(barnorm="percent")
+        fig.update_xaxes(ticksuffix="%", title=None)
+    else:
+        int_axis(fig, data.groupby(ycol)["count"].sum().max() if len(data) else 0)
     return fig
 
 
-def heatmap(matrix, title, height=380, tickangle=-18):
+def heatmap(matrix: pd.DataFrame, title: str, height: int = 400, xlab: str = "", ylab: str = ""):
     fig = px.imshow(matrix, aspect="auto", text_auto=True,
                     color_continuous_scale=HEAT_SCALE, title=title)
-    fig.update_layout(height=height, xaxis_title=None, yaxis_title=None,
-                      coloraxis_showscale=False)
-    fig.update_xaxes(tickangle=tickangle)
+    fig.update_layout(height=height, coloraxis_showscale=False,
+                      xaxis_title=xlab or None, yaxis_title=ylab or None,
+                      margin=dict(t=52, b=20, l=10, r=18))
+    fig.update_xaxes(tickangle=-30, side="bottom")
+    fig.update_traces(hovertemplate="%{y} → %{x}: %{z}<extra></extra>")
     return fig
 
 
-def ai_summary(text):
-    st.markdown(f"<div class='ai-box'><span class='tag'>🤖 AI Summary</span><br>{text}</div>",
+def readout(text: str):
+    st.markdown(f"<div class='read'><span class='tag'>Summary of this view</span>{text}</div>",
                 unsafe_allow_html=True)
 
 
-HELP = {
-    "Interactions": "One member intervention on one document/topic.",
-    "Members": "Distinct members taking part.",
-    "WTO bodies": "Distinct WTO councils/committees involved.",
-    "Domain families": "Top-level subject areas.",
-    "Measures": "Named policy measures discussed.",
-    "Functions": "How members engage: Concern Raised, Proposal/Recommendation, "
-                 "Defence/Explanation, Information Sharing.",
-}
+def note(text: str):
+    st.markdown(f"<div class='note'>{text}</div>", unsafe_allow_html=True)
 
 
-def metric_strip(data):
-    """Show metrics, but drop any dimension that collapses to a single value (keeps the ribbon
-    meaningful — e.g. when one member is selected, the 'Members' tile disappears)."""
-    raw = [
-        ("Interactions", len(data)),
-        ("Members", data["Participant"].nunique()),
-        ("WTO bodies", data["Forum"].nunique()),
-        ("Domain families", data["Domain Family"].nunique()),
-        ("Measures", data[data["Measure"] != NO_MEASURE]["Measure"].nunique()),
-        ("Functions", data["Governance function"].nunique()),
-    ]
-    visible = [(l, v) for l, v in raw if l == "Interactions" or v > 1]
-    cols = st.columns(len(visible))
-    for c, (label, value) in zip(cols, visible):
-        c.metric(label, value, help=HELP.get(label))
+def stance_strip(d: pd.DataFrame):
+    counts = d["Stance"].value_counts()
+    total = int(counts.sum())
+    if not total:
+        return
+    bars, keys = [], []
+    for s in STANCE_ORDER:
+        n = int(counts.get(s, 0))
+        if not n:
+            continue
+        bars.append(f"<div style='width:{n / total * 100:.3f}%;background:{STANCE_COLORS[s]};'></div>")
+        keys.append(f"<span><span class='dot' style='background:{STANCE_COLORS[s]}'></span>"
+                    f"{s} <b>{n}</b> · {pct(n, total)}%</span>")
+    st.markdown(f"<div class='strip'>{''.join(bars)}</div>"
+                f"<div class='strip-key'>{''.join(keys)}</div>", unsafe_allow_html=True)
 
 
-def members_phrase(data):
-    n = data["Participant"].nunique()
-    if n == 1:
-        return f"<b>{data['Participant'].dropna().iloc[0]}</b>"
-    return f"<b>{n} members</b>"
+def top_label(series: pd.Series) -> tuple[str, int]:
+    s = series.dropna()
+    if s.empty:
+        return "—", 0
+    counts = s.value_counts()
+    return str(counts.index[0]), int(counts.iloc[0])
 
 
-def bodies_phrase(data):
-    n = data["Forum"].nunique()
-    if n == 1:
-        return f"the <b>{data['Forum'].dropna().iloc[0]}</b>"
-    return f"<b>{n} WTO bodies</b>"
+def joined(items, limit: int = 3) -> str:
+    items = [str(i) for i in items][:limit]
+    if not items:
+        return "—"
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
 
 
-df = add_forum_labels(load_data())
+def small_n(d: pd.DataFrame) -> str:
+    return (" <b>Small sample</b> — with fewer than 20 interactions in view, read shares as"
+            " illustrative rather than representative." if len(d) < 20 else "")
 
-# --------------------------------------------------------------------------------------
-# Global filters (sidebar, multiselect, empty = all)
-# --------------------------------------------------------------------------------------
-st.sidebar.title("🌐 Filters")
-st.sidebar.caption("Leave a filter empty to include everything. Applies across all tabs.")
 
-body_filter = st.sidebar.multiselect("WTO Body", sorted(df["Forum"].dropna().unique()))
-member_filter = st.sidebar.multiselect("Member", sorted(df["Participant"].dropna().unique()))
-domain_filter = st.sidebar.multiselect("Domain Family", sorted(df["Domain Family"].dropna().unique()))
-func_filter = st.sidebar.multiselect("Governance Function", sorted(df["Governance function"].dropna().unique()))
+def concentration_note(d: pd.DataFrame) -> str:
+    """Flag when one meeting record dominates the view — G/C/M/153 is a third of the corpus."""
+    if d.empty or "Document_Symbol" not in d.columns:
+        return ""
+    doc, n = top_label(d["Document_Symbol"])
+    share = pct(n, len(d))
+    if share >= 30 and len(d) > 10:
+        return (f" Note that <b>{doc}</b> alone accounts for {share}% of the rows in view,"
+                " so member rankings partly reflect who attended that one meeting.")
+    return ""
+
+
+# ======================================================================================
+# Load
+# ======================================================================================
+wb = find_workbook()
+if wb is None:
+    st.error(
+        "**Workbook not found.** Place `Database_v21.xlsx` in the same folder as `app.py` "
+        "(the app also accepts `Database.xlsx` or any `Database*.xlsx`), then reload."
+    )
+    st.stop()
+
+df, vocab, issues = load_data(str(wb), wb.stat().st_mtime)
+
+DOMAIN = df["Domain"].dropna().iloc[0] if "Domain" in df.columns and df["Domain"].notna().any() else "—"
+COVER_FROM = df["Date"].min()
+COVER_TO = df["Date"].max()
+
+# ======================================================================================
+# Filters
+# ======================================================================================
+st.sidebar.header("Filters")
+st.sidebar.caption("Leave a filter empty to include everything. Filters apply to every tab.")
+
+all_subdomains = sorted(subdomains_long(df)["SubDomain"].unique())
+all_groups = sorted(measures_long(df)["Measure_Group"].unique())
+
+f_forum = st.sidebar.multiselect("WTO body", sorted(df["Forum"].dropna().unique()))
+f_member = st.sidebar.multiselect("Member speaking", sorted(df["Member"].dropna().unique()))
+f_stance = st.sidebar.multiselect("Stance", [s for s in STANCE_ORDER if s in set(df["Stance"].dropna())])
+f_sub = st.sidebar.multiselect("Security sub-domain", all_subdomains,
+                               help="Matches either the primary or the secondary sub-domain.")
+f_group = st.sidebar.multiselect("Measure family", all_groups)
+f_owner = st.sidebar.multiselect("Measure owner", sorted(df["Owner"].dropna().unique()),
+                                 help="The member whose measure is being discussed — not the speaker.")
+
+core_only = st.sidebar.toggle("Core relevance only", value=False,
+                              help="Keep only rows flagged Core in Security_Relevance.")
+
+d_from = d_to = None
+if pd.notna(COVER_FROM) and pd.notna(COVER_TO):
+    picked = st.sidebar.date_input(
+        "Date range", value=(COVER_FROM.date(), COVER_TO.date()),
+        min_value=COVER_FROM.date(), max_value=COVER_TO.date(),
+    )
+    # Streamlit returns a one-item tuple while the user is mid-selection.
+    if isinstance(picked, (list, tuple)):
+        d_from = picked[0] if picked else COVER_FROM.date()
+        d_to = picked[1] if len(picked) > 1 else COVER_TO.date()
+    else:
+        d_from = d_to = picked
 
 filtered = df.copy()
-if body_filter:
-    filtered = filtered[filtered["Forum"].isin(body_filter)]
-if member_filter:
-    filtered = filtered[filtered["Participant"].isin(member_filter)]
-if domain_filter:
-    filtered = filtered[filtered["Domain Family"].isin(domain_filter)]
-if func_filter:
-    filtered = filtered[filtered["Governance function"].isin(func_filter)]
+if f_forum:
+    filtered = filtered[filtered["Forum"].isin(f_forum)]
+if f_member:
+    filtered = filtered[filtered["Member"].isin(f_member)]
+if f_stance:
+    filtered = filtered[filtered["Stance"].isin(f_stance)]
+if f_owner:
+    filtered = filtered[filtered["Owner"].isin(f_owner)]
+if core_only and "Security_Relevance" in filtered.columns:
+    filtered = filtered[filtered["Security_Relevance"] == "Core"]
+if f_sub:
+    ids = set(subdomains_long(df).loc[lambda x: x["SubDomain"].isin(f_sub), "Row_ID"])
+    filtered = filtered[filtered["Row_ID"].isin(ids)]
+if f_group:
+    ids = set(measures_long(df).loc[lambda x: x["Measure_Group"].isin(f_group), "Row_ID"])
+    filtered = filtered[filtered["Row_ID"].isin(ids)]
+if d_from and d_to:
+    filtered = filtered[(filtered["Date"] >= pd.Timestamp(d_from)) & (filtered["Date"] <= pd.Timestamp(d_to))]
 
 st.sidebar.markdown("---")
-st.sidebar.metric("Rows in current view", f"{len(filtered)} / {len(df)}")
-if st.sidebar.button("Reset filters", width="stretch", key="reset_btn"):
+st.sidebar.metric("Interactions in view", f"{len(filtered)} / {len(df)}")
+if st.sidebar.button("Reset filters", width="stretch", key="reset"):
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
     st.rerun()
 
-# --------------------------------------------------------------------------------------
-# Centred header
-# --------------------------------------------------------------------------------------
-st.markdown("<div class='app-title'>Trade Governance Lab</div>", unsafe_allow_html=True)
+# ======================================================================================
+# Masthead
+# ======================================================================================
+cover = (f"{COVER_FROM:%d %b %Y} – {COVER_TO:%d %b %Y}"
+         if COVER_FROM is not pd.NaT else "—")
 st.markdown(
-    "<div class='app-sub'>How WTO members engage with trade-policy topics across different WTO bodies.</div>",
+    f"""
+    <div class="masthead">
+      <div class="eyebrow">WTO discussion analytics</div>
+      <h1>Trade Governance Lab</h1>
+      <div class="sub">How WTO members argue about <b>{DOMAIN.lower()}</b> — which measures they
+      raise, whose measures they raise them about, and the grounds they argue on.</div>
+      <div class="meta">{len(df)} interactions · {df['Document_Symbol'].nunique()} documents ·
+      {df['Participant'].nunique()} members · {df['Forum'].nunique()} WTO bodies · {cover}</div>
+    </div>
+    """,
     unsafe_allow_html=True,
 )
 
-col1, col2 = st.columns([1,1])
-with col1:
-    st.caption("**Coverage:** 1 Jan 2026 to 15 Jun 2026")
-with col2:
-    st.caption("**Last updated:** 14 Jul 2026")
-
-st.caption(
-    "**WTO Body legend:** "
-    "**GC** = General Council · "
-    "**CTG** = Council for Trade in Goods · "
-    "**CTD** = Committee on Trade and Development · "
-    "**CTE** = Committee on Trade and Environment · "
-    "**CTF** = Committee on Trade Facilitation"
-)
-
-
 if filtered.empty:
-    st.warning("No rows match the current filters. Use **Reset filters** in the sidebar.")
+    st.warning("No interactions match the current filters. Use **Reset filters** in the sidebar.")
     st.stop()
 
-tab_overview, tab_gov, tab_dom, tab_mem, tab_meas, tab_bodies, tab_exp = st.tabs(
-    ["📊 Overview", "🏛️ Governance", "🗂️ Domains", "👥 Members", "📑 Measures", "🏢 WTO Bodies", "🔎 Explorer"]
+stance_strip(filtered)
+
+M = measures_long(filtered)
+S = subdomains_long(filtered)
+T = topics_long(filtered)
+
+tab_over, tab_mem, tab_meas, tab_frame, tab_data = st.tabs(
+    ["Overview", "Members", "Measures", "Framing", "Data & method"]
 )
 
 # ======================================================================================
 # OVERVIEW
 # ======================================================================================
-with tab_overview:
-    metric_strip(filtered)
+with tab_over:
+    named = M[M["Measure"] != UNSPECIFIED]
+    cols = st.columns(6)
+    tiles = [
+        ("Interactions", len(filtered), "One member intervention on one agenda item."),
+        ("Members", filtered["Member"].nunique(), "Distinct members speaking."),
+        ("Documents", filtered["Document_Symbol"].nunique(), "WTO documents the rows are drawn from."),
+        ("WTO bodies", filtered["Forum"].nunique(), "Councils and committees involved."),
+        ("Named measures", named["Measure"].nunique(), "Distinct measures identified by name."),
+        ("Core relevance", pcs(int((filtered['Security_Relevance'] == 'Core').sum()), len(filtered)),
+         "Share of rows where security is the core of the intervention rather than context."),
+    ]
+    for c, (label, value, help_text) in zip(cols, tiles):
+        c.metric(label, value, help=help_text)
 
-    funcs = vc(filtered["Governance function"])
-    dom = vc(filtered["Domain Family"])
-    real_measures = filtered[filtered["Measure"] != NO_MEASURE]
-    top_measure = vc(real_measures["Measure"], 1)
-    top_member = vc(filtered["Participant"], 1)
+    top_stance, n_stance = top_label(filtered["Stance"])
+    top_sub, n_sub = top_label(S["SubDomain"])
+    top_grp, n_grp = top_label(named["Measure_Group"])
+    top_mem, n_mem = top_label(filtered["Member"])
+    top_forum, n_forum = top_label(filtered["Forum"])
+    owners = filtered.loc[~filtered["Owner"].isin(["Not applicable"]), "Owner"]
+    top_owner, n_owner = top_label(owners)
 
-    summary = (f"This view covers <b>{len(filtered)} interactions</b> from "
-               f"{members_phrase(filtered)} across {bodies_phrase(filtered)}. ")
-    if not funcs.empty:
-        summary += (f"The dominant mode of engagement is <b>{funcs.iloc[0]['label']}</b> "
-                    f"({pct(funcs.iloc[0]['count'], len(filtered))}% of activity). ")
-    if not dom.empty:
-        summary += f"Discussion is concentrated in <b>{dom.iloc[0]['label']}</b>. "
-    if not top_measure.empty:
-        summary += f"The most-debated named measure is <b>{top_measure.iloc[0]['label']}</b>"
-        if filtered["Participant"].nunique() > 1 and not top_member.empty:
-            summary += f", and the most active member is <b>{top_member.iloc[0]['label']}</b>"
-        summary += "."
-    ai_summary(summary)
-
-
-    st.markdown("### Explore the dataset")
-
-    view = st.radio(
-        "Analyse interactions by",
-        [
-            "Measures",
-            "Members",
-            "Domain Families",
-            "Governance Functions",
-            "WTO Bodies",
-        ],
-        horizontal=True,
-        key="overview_selector",
+    readout(
+        f"This view holds <b>{len(filtered)}</b> interactions by <b>{filtered['Member'].nunique()}</b> "
+        f"members across <b>{filtered['Forum'].nunique()}</b> WTO bodies, drawn from "
+        f"<b>{filtered['Document_Symbol'].nunique()}</b> documents. The prevailing stance is "
+        f"<b>{top_stance}</b> ({pcs(n_stance, len(filtered))} of interactions). Discussion clusters on "
+        f"<b>{top_sub}</b> ({n_sub} mentions) and, among named measures, on "
+        f"<b>{top_grp}</b> ({n_grp} mentions). <b>{top_mem}</b> speaks most often ({n_mem} interactions), "
+        f"while <b>{top_owner}</b> is the member whose measures are discussed most ({n_owner} interactions). "
+        f"Most of this happens in <b>{FORUM_FULL.get(top_forum, top_forum)}</b> "
+        f"({pcs(n_forum, len(filtered))}).{concentration_note(filtered)}{small_n(filtered)}"
     )
-
-    if view == "Measures":
-        fig = hbar(vc(real_measures["Measure"], 12), "Top measures (by interactions)")
-    elif view == "Members":
-        fig = hbar(vc(filtered["Participant"], 12), "Top members (by interactions)")
-    elif view == "Domain Families":
-        fig = hbar(vc(filtered["Domain Family"]), "Domain family share")
-    elif view == "Governance Functions":
-        fig = hbar(vc(filtered["Governance function"]), "How members engage")
-    else:
-        fig = hbar(vc(filtered["Forum"]), "Activity by WTO body")
-
-    show(st, fig, "overview_dynamic_chart")
-
-    with st.expander("Show underlying data"):
-        display_cols = [
-            c for c in [
-                "Date",
-                "Participant",
-                "Forum",
-                "Domain Family",
-                "Governance function",
-                "Measure",
-                "Interaction_Summary",
-            ]
-            if c in filtered.columns
-        ]
-        st.dataframe(
-            filtered[display_cols].sort_values("Date"),
-            width="stretch",
-            hide_index=True,
-        )
-
-# ======================================================================================
-# GOVERNANCE
-# ======================================================================================
-with tab_gov:
-    gov_long = melt_pairs(filtered, ("Governance Dimension", "Governance Topic"), 5)
-    dims = vc(gov_long["Dimension"])
-    topics = vc(gov_long["Topic"], 1)
-
-    summary = (f"Members invoked <b>{len(gov_long)} governance considerations</b> across "
-               f"<b>{gov_long['Dimension'].nunique()} dimensions</b>. ")
-    if not dims.empty:
-        summary += (f"The most prominent dimension is <b>{dims.iloc[0]['label']}</b> "
-                    f"({pct(dims.iloc[0]['count'], max(len(gov_long), 1))}% of considerations). ")
-    if not topics.empty:
-        summary += f"The single most-raised topic is <b>{topics.iloc[0]['label']}</b>. "
-    summary += ("The heatmap shows how each governance function maps onto each domain family.")
-    ai_summary(summary)
 
     c1, c2 = st.columns(2)
-    show(c1, hbar(vc(filtered["Governance function"]), "Governance functions"), "gov_func")
-    show(c2, hbar(dims, "Governance dimensions raised"), "gov_dims")
+    sub_stance = (S.groupby(["SubDomain", "Stance"]).size().reset_index(name="count"))
+    show(stance_hbar(sub_stance, "SubDomain", "Security sub-domains, by stance", xlabel="mentions"),
+         "ov_sub", c1)
+    c1.caption("A row can carry a primary and a secondary sub-domain, so mentions exceed interactions.")
 
-    # Cleaner than a treemap: topics as bars, coloured by their parent dimension.
-    topic_dim = gov_long.groupby(["Dimension", "Topic"]).size().reset_index(name="count")
-    if not topic_dim.empty:
-        show(st, grouped_hbar(topic_dim, "Topic", "Dimension",
-                              "Governance topics (coloured by dimension)", top=14), "gov_topics")
+    forum_stance = filtered.groupby(["Forum", "Stance"]).size().reset_index(name="count")
+    show(stance_hbar(forum_stance, "Forum", "Where the discussion happens, by stance", xlabel="interactions"),
+         "ov_forum", c2)
+    c2.caption(" · ".join(f"**{k}** {v}" for k, v in FORUM_FULL.items() if k in set(filtered["Forum"])))
 
-    c3, c4 = st.columns(2)
-    # Domain families (long names) on the y-axis where they have room; functions angled on x.
-    heat = pd.crosstab(filtered["Domain Family"], filtered["Governance function"])
-    if heat.size:
-        show(c3, heatmap(heat, "Domain family × governance function"), "gov_heat")
+    grp_stance = named.groupby(["Measure_Group", "Stance"]).size().reset_index(name="count")
+    if len(grp_stance):
+        show(stance_hbar(grp_stance, "Measure_Group", "Measure families, by stance", xlabel="mentions"),
+             "ov_group")
+        note("Families are assembled in the app from the individual measure labels — the full "
+             "mapping is on the <b>Data & method</b> tab.")
 
-    # Horizontal stacked → forum names no longer clipped; titles cleared to avoid overlap.
-    stacked = filtered.groupby(["Forum", "Governance function"]).size().reset_index(name="count")
-    fig = px.bar(stacked, y="Forum", x="count", color="Governance function", orientation="h",
-                 title="How each body engages", color_discrete_sequence=PALETTE)
-    fig.update_layout(height=430, barmode="stack", xaxis_title=None, yaxis_title=None,
-                      legend_title_text="", margin=dict(t=50, b=120, l=10, r=18),
-                      legend=dict(orientation="h", yanchor="top", y=-0.32, x=0.5, xanchor="center"))
-    int_axis(fig, stacked.groupby("Forum")["count"].sum().max() if len(stacked) else 0)
-    show(c4, fig, "gov_bodyengage")
-
-# ======================================================================================
-# DOMAINS
-# ======================================================================================
-with tab_dom:
-    sub_long_all = melt_subdomains(filtered)
-    fam = vc(filtered["Domain Family"])
-    subs = vc(sub_long_all["Sub-Domain"], 1)
-
-    summary = (f"Discussion spans <b>{filtered['Domain Family'].nunique()} domain families</b> and "
-               f"<b>{sub_long_all['Sub-Domain'].nunique()} sub-domains</b>. ")
-    if not fam.empty:
-        summary += (f"<b>{fam.iloc[0]['label']}</b> is the largest family "
-                    f"({pct(fam.iloc[0]['count'], len(filtered))}% of interactions). ")
-    if not subs.empty:
-        summary += f"The most discussed sub-domain is <b>{subs.iloc[0]['label']}</b>. "
-    summary += "Use the focus filter to narrow to one or more families."
-    ai_summary(summary)
-
-    # Cleaner than a treemap: sub-domains as bars, coloured by their family.
-    sub_fam = sub_long_all.groupby(["Domain Family", "Sub-Domain"]).size().reset_index(name="count")
-    if not sub_fam.empty:
-        show(st, grouped_hbar(sub_fam, "Sub-Domain", "Domain Family",
-                              "Sub-domains (coloured by domain family)", top=16), "dom_subfam")
-
-    st.markdown("#### Focus on domain families")
-    fam_opts = sorted(filtered["Domain Family"].dropna().unique())
-    fam_sel = st.multiselect("Domain families (leave empty for all)", fam_opts, key="dom_sel")
-    frows = filtered if not fam_sel else filtered[filtered["Domain Family"].isin(fam_sel)]
-    fsub = sub_long_all if not fam_sel else sub_long_all[sub_long_all["Domain Family"].isin(fam_sel)]
-    scope = "all families" if not fam_sel else (fam_sel[0] if len(fam_sel) == 1 else f"{len(fam_sel)} families")
-
-    c1, c2 = st.columns(2)
-    show(c1, hbar(vc(fsub["Sub-Domain"], 12), f"Sub-domains · {scope}"), "dom_subs")
-    show(c2, hbar(vc(frows["Governance function"]), "How it is discussed"), "dom_func")
-
-    c3, c4 = st.columns(2)
-    member_func = (
-        frows.groupby(["Participant", "Governance function"])
-             .size()
-             .reset_index(name="count")
-    )
-    top_members = (
-        frows["Participant"]
-             .value_counts()
-             .head(10)
-             .index
-    )
-    member_func = member_func[member_func["Participant"].isin(top_members)]
-    fig = px.bar(
-        member_func,
-        y="Participant",
-        x="count",
-        color="Governance function",
-        orientation="h",
-        barmode="stack",
-        title="Most engaged members by governance function",
-        color_discrete_sequence=PALETTE,
-    )
-    fig.update_layout(
-        height=420,
-        xaxis_title=None,
-        yaxis_title=None,
-        legend_title_text="",
-        legend=dict(
-            orientation="h",
-            y=-0.25,
-            x=0.5,
-            xanchor="center"
-        ),
-    )
-    int_axis(fig, member_func.groupby("Participant")["count"].sum().max() if len(member_func) else 0)
-    show(c3, fig, "dom_members_stack")
-    show(c4, hbar(vc(frows["Forum"]), "Where it is discussed"), "dom_forum")
+    if SHOW_TIME_CHARTS:
+        monthly = (filtered.assign(Month=filtered["Date"].dt.to_period("M").dt.to_timestamp())
+                   .groupby(["Month", "Stance"]).size().reset_index(name="count"))
+        fig = px.bar(monthly, x="Month", y="count", color="Stance",
+                     color_discrete_map=STANCE_COLORS, title="Interactions over time")
+        show(fig, "ov_time")
 
 # ======================================================================================
 # MEMBERS
 # ======================================================================================
 with tab_mem:
-    members = vc(filtered["Participant"], 15)
-    summary = f"{members_phrase(filtered)} appear in this view. "
-    if filtered["Participant"].nunique() > 1 and not members.empty:
-        lead = members.iloc[0]
-        summary += (f"<b>{lead['label']}</b> is the most active "
-                    f"({lead['count']} interactions, {pct(lead['count'], len(filtered))}% of the total). ")
-    summary += ("Use the focus filter for a profile: the domains members engage, how they engage, "
-                "the governance dimensions they emphasise, and their measures.")
-    ai_summary(summary)
+    st.subheader("Who speaks, and how")
 
-    show(st, hbar(members, "Most active members"), "mem_active")
+    n_members = filtered["Member"].nunique()
+    if n_members > 6:
+        top_n = st.slider("Members shown", 5, min(30, n_members), min(15, n_members), key="mem_topn")
+    else:
+        top_n = n_members
+    normalise = st.toggle("Show stance as a share of each member's interactions", value=False,
+                          key="mem_norm",
+                          help="Useful when comparing members with very different totals.")
 
-    top_names = members["label"].head(10).tolist()
-    sub = filtered[filtered["Participant"].isin(top_names)]
-    cross = pd.crosstab(sub["Domain Family"], sub["Participant"])
-    if cross.size and cross.shape[1] > 1:
-        show(st, heatmap(cross, "Domain family × member (top members)", height=360, tickangle=-30),
-             "mem_heat")
+    keep_members = filtered["Member"].value_counts().head(top_n).index
+    mem_stance = (filtered[filtered["Member"].isin(keep_members)]
+                  .groupby(["Member", "Stance"]).size().reset_index(name="count"))
 
-    st.markdown("#### Member profile")
-    mem_opts = sorted(filtered["Participant"].dropna().unique())
-    mem_sel = st.multiselect("Members (leave empty for all)", mem_opts, key="mem_sel")
-    mdata = filtered if not mem_sel else filtered[filtered["Participant"].isin(mem_sel)]
-    mdims = melt_pairs(mdata, ("Governance Dimension", "Governance Topic"), 5)
+    counts = filtered["Member"].value_counts()
+    apprehensive = (filtered[filtered["Stance"] == "Apprehension"]["Member"].value_counts()
+                    .reindex(counts.index).fillna(0))
+    defending = (filtered[filtered["Stance"] == "Defence/Explanation"]["Member"].value_counts()
+                 .reindex(counts.index).fillna(0))
+    vocal = counts[counts >= 3]
+    critics = (apprehensive / counts).reindex(vocal.index).sort_values(ascending=False)
+    defenders = (defending / counts).reindex(vocal.index).sort_values(ascending=False)
 
-    metric_strip(mdata)
+    readout(
+        f"<b>{filtered['Member'].nunique()}</b> members take part. "
+        f"{joined(counts.head(3).index)} speak most often "
+        f"({joined([str(i) for i in counts.head(3).values])} interactions respectively). "
+        + (f"Among members with at least three interactions, "
+           f"<b>{critics.index[0]}</b> is the most consistently apprehensive "
+           f"({pcs(int(apprehensive[critics.index[0]]), int(counts[critics.index[0]]))} of its interventions), "
+           f"and <b>{defenders.index[0]}</b> spends the largest share of its interventions defending or "
+           f"explaining measures ({pcs(int(defending[defenders.index[0]]), int(counts[defenders.index[0]]))}). "
+           if len(vocal) else "")
+        + concentration_note(filtered) + small_n(filtered)
+    )
 
-    c1, c2 = st.columns(2)
-    show(c1, hbar(vc(mdata["Domain Family"]), "Domains engaged"), "mem_dom")
-    show(c2, hbar(vc(mdata["Governance function"]), "How they engage"), "mem_func")
+    show(stance_hbar(mem_stance, "Member", f"Top {len(keep_members)} members, by stance",
+                     normalise=normalise, xlabel="" if normalise else "interactions"),
+         "mem_stance")
 
-    c3, c4 = st.columns(2)
-    show(c3, hbar(vc(mdims["Dimension"]), "Governance dimensions emphasised"), "mem_dims")
-    show(c4, hbar(vc(mdata["Forum"]), "Bodies where active"), "mem_forum")
+    st.markdown("#### Who raises measures about whom")
+    pairs = filtered[(filtered["Owner"].notna()) & (~filtered["Owner"].isin(["Not applicable"]))]
+    if len(pairs) >= 5:
+        mat = pd.crosstab(pairs["Member"], pairs["Owner"])
+        mat = mat.loc[mat.sum(axis=1).sort_values(ascending=False).index]
+        mat = mat[mat.sum().sort_values(ascending=False).index]
+        mat = mat.iloc[:14, :10]
+        show(heatmap(mat, "Speaker (row) → owner of the measure discussed (column)",
+                     height=max(340, 26 * len(mat) + 150),
+                     xlab="measure owner", ylab="member speaking"), "mem_matrix")
+        self_ref = int((pairs["Member"] == pairs["Owner"]).sum())
+        note(f"The diagonal is self-reference: <b>{self_ref}</b> interactions "
+             f"({pcs(self_ref, len(pairs))} of attributed rows) are members speaking about their own "
+             "measures — typically defence or explanation. Rows where the owner is "
+             "<i>Not applicable</i> are excluded here.")
+    else:
+        note("Too few rows with an attributed measure owner in this view to draw the matrix.")
 
-    real = mdata[mdata["Measure"] != NO_MEASURE]
-    if not real.empty:
-        show(st, hbar(vc(real["Measure"], 10), "Measures engaged with"), "mem_meas")
-
-    with st.expander("Read the underlying interaction summaries"):
-        cols_show = [c for c in ["Date", "Participant", "Forum", "Domain Family",
-                                 "Governance function", "Measure", "Interaction_Summary"]
-                     if c in mdata.columns]
-        st.dataframe(mdata[cols_show].sort_values("Date"), width="stretch", hide_index=True)
+    st.markdown("#### Sub-domain focus by member")
+    sub_mem = S[S["Member"].isin(keep_members[:12])]
+    if len(sub_mem) >= 5:
+        mat2 = pd.crosstab(sub_mem["Member"], sub_mem["SubDomain"])
+        mat2 = mat2.loc[mat2.sum(axis=1).sort_values(ascending=False).index]
+        show(heatmap(mat2, "Security sub-domains raised, by member",
+                     height=max(320, 26 * len(mat2) + 140), xlab="sub-domain", ylab="member"),
+             "mem_sub")
+    else:
+        note("Not enough sub-domain mentions in this view for a member breakdown.")
 
 # ======================================================================================
 # MEASURES
 # ======================================================================================
 with tab_meas:
-    real_measures = filtered[filtered["Measure"] != NO_MEASURE]
-    owners = vc(filtered[filtered["Measure_Owner"] != "Not applicable"]["Measure_Owner"], 12)
-    mtop = vc(real_measures["Measure"], 1)
+    st.subheader("What is being discussed")
 
-    summary = f"<b>{real_measures['Measure'].nunique()} named measures</b> are under discussion. "
-    if not mtop.empty:
-        summary += f"The most contested is <b>{mtop.iloc[0]['label']}</b>. "
-    if not owners.empty:
-        summary += (f"<b>{owners.iloc[0]['label']}</b> owns the most measures under scrutiny. "
-                    "Use the focus filter to study specific measures.")
-    ai_summary(summary)
+    hide_unspec = st.toggle("Hide unspecified measures", value=True, key="meas_hide",
+                            help=f"'{UNSPECIFIED}' marks interventions with no named measure. "
+                                 "They stay in the interaction count either way.")
+    Mv = M[M["Measure"] != UNSPECIFIED] if hide_unspec else M
 
-    c1, c2 = st.columns(2)
-    show(c1, hbar(vc(real_measures["Measure"], 12), "Most-discussed measures"), "meas_top")
-    show(c2, hbar(owners, "Measure owners (under scrutiny)"), "meas_owners")
-
-    st.markdown("#### Focus on measures")
-    opts = sorted(real_measures["Measure"].dropna().unique())
-    if opts:
-        sel = st.multiselect("Measures (leave empty for all)", opts, key="meas_sel")
-        mdata = real_measures if not sel else filtered[filtered["Measure"].isin(sel)]
-
-        owner_val = mdata["Measure_Owner"].mode()
-        cstats = st.columns(4)
-        cstats[0].metric("Interactions", len(mdata))
-        cstats[1].metric("Members engaged", mdata["Participant"].nunique())
-        cstats[2].metric("Bodies", mdata["Forum"].nunique())
-        cstats[3].metric("Top owner", owner_val.iloc[0] if not owner_val.empty else "—")
-
-        c1, c2 = st.columns(2)
-        show(c1, hbar(vc(mdata["Participant"], 12), "Who engages these measures"), "meas_who")
-        show(c2, hbar(vc(mdata["Governance function"]), "How they are engaged"), "meas_how")
-
-        c3, c4 = st.columns(2)
-        show(c3, hbar(vc(mdata["Domain Family"]), "Domain framing"), "meas_dom")
-        show(c4, hbar(vc(mdata["Forum"]), "Where they are discussed"), "meas_forum")
+    if Mv.empty:
+        note("No measures match the current filters.")
     else:
-        st.info("No named measures in the current view — adjust the filters.")
+        counts = Mv["Measure"].value_counts()
+        grp_counts = Mv["Measure_Group"].value_counts()
+        unspec_n = int((M["Measure"] == UNSPECIFIED).sum())
 
+        contested = (Mv.assign(is_app=Mv["Stance"] == "Apprehension")
+                     .groupby("Measure")
+                     .agg(mentions=("Row_ID", "nunique"), apprehension=("is_app", "sum")))
+        floor = st.slider("Minimum mentions for the contested ranking", 1, 8, 3, key="meas_floor")
+        contested = contested[contested["mentions"] >= floor]
+        contested["share"] = (contested["apprehension"] / contested["mentions"] * 100).round(1)
+        contested = contested.sort_values(["share", "mentions"], ascending=False)
 
-# ======================================================================================
-# WTO BODIES
-# ======================================================================================
-with tab_bodies:
-    bodies = vc(filtered["Forum"])
-    top_body = vc(filtered["Forum"], 1)
-
-    summary = f"This view covers <b>{filtered['Forum'].nunique()} WTO bodies</b>. "
-    if not top_body.empty:
-        summary += f"The most active body is <b>{top_body.iloc[0]['label']}</b>. "
-    summary += "Compare participation, policy focus and governance patterns across WTO bodies."
-    ai_summary(summary)
-
-    show(st, hbar(bodies, "Interactions by WTO body"), "body_overview")
-
-    st.markdown("#### Focus on WTO bodies")
-    body_opts = sorted(filtered["Forum"].dropna().unique())
-    body_sel = st.multiselect(
-        "WTO bodies (leave empty for all)",
-        body_opts,
-        key="body_sel",
-    )
-
-    bdata = filtered if not body_sel else filtered[filtered["Forum"].isin(body_sel)]
-
-    metric_strip(bdata)
-
-    c1, c2 = st.columns(2)
-    show(c1, hbar(vc(bdata["Participant"], 12), "Most active members"), "body_members")
-    show(c2, hbar(vc(bdata[bdata["Measure"] != NO_MEASURE]["Measure"], 12),
-                  "Most discussed measures"), "body_measures")
-
-    c3, c4 = st.columns(2)
-    show(c3, hbar(vc(bdata["Domain Family"]), "Most discussed domain families"), "body_domains")
-    show(c4, hbar(vc(bdata["Governance function"]), "Governance functions"), "body_functions")
-
-    st.markdown("#### Cross-body comparisons")
-
-    c5, c6 = st.columns(2)
-
-    stacked = (
-        filtered.groupby(["Forum", "Governance function"])
-        .size()
-        .reset_index(name="count")
-    )
-
-    fig = px.bar(
-        stacked,
-        y="Forum",
-        x="count",
-        color="Governance function",
-        orientation="h",
-        barmode="stack",
-        title="Governance functions across WTO bodies",
-        color_discrete_sequence=PALETTE,
-    )
-    fig.update_layout(
-        height=420,
-        xaxis_title=None,
-        yaxis_title=None,
-        legend_title_text="",
-        legend=dict(
-            orientation="h",
-            y=-0.25,
-            x=0.5,
-            xanchor="center",
-        ),
-    )
-    int_axis(fig, stacked.groupby("Forum")["count"].sum().max() if len(stacked) else 0)
-    show(c5, fig, "body_stack")
-
-    heat = pd.crosstab(filtered["Domain Family"], filtered["Forum"])
-    if heat.size:
-        show(
-            c6,
-            heatmap(
-                heat,
-                "Domain families across WTO bodies",
-                height=420,
-                tickangle=-20,
-            ),
-            "body_heat",
+        readout(
+            f"<b>{Mv['Measure'].nunique()}</b> distinct measures appear in "
+            f"<b>{len(Mv)}</b> mentions, falling into <b>{Mv['Measure_Group'].nunique()}</b> families. "
+            f"The largest family is <b>{grp_counts.index[0]}</b> ({int(grp_counts.iloc[0])} mentions); "
+            f"the most-discussed single measure is <b>{counts.index[0]}</b> ({int(counts.iloc[0])} mentions). "
+            + (f"Of measures mentioned at least {floor} times, <b>{contested.index[0]}</b> draws the highest "
+               f"share of apprehension ({contested['share'].iloc[0]:g}% of its mentions). "
+               if len(contested) else "")
+            + (f"A further <b>{unspec_n}</b> interactions in this view raise no named measure and are "
+               f"{'excluded from' if hide_unspec else 'included in'} these charts."
+               if unspec_n else "")
+            + small_n(filtered)
         )
 
-    with st.expander("Read the underlying interactions"):
-        cols_show = [
-            c
-            for c in [
-                "Date",
-                "Participant",
-                "Forum",
-                "Domain Family",
-                "Governance function",
-                "Measure",
-                "Interaction_Summary",
-            ]
-            if c in bdata.columns
-        ]
-        st.dataframe(
-            bdata[cols_show].sort_values("Date"),
-            width="stretch",
-            hide_index=True,
+        c1, c2 = st.columns([3, 2])
+        top_measures = vc(Mv["Measure"], top=14)
+        show(hbar(top_measures, "Most-discussed measures", xlabel="mentions"), "meas_top", c1)
+        show(hbar(vc(Mv["Measure_Group"]), "Measure families", xlabel="mentions"), "meas_grp", c2)
+
+        meas_stance = (Mv[Mv["Measure"].isin(top_measures["label"])]
+                       .groupby(["Measure", "Stance"]).size().reset_index(name="count"))
+        show(stance_hbar(meas_stance, "Measure", "Stance towards each measure",
+                         normalise=True), "meas_stance")
+        note("Shares, so a measure raised twice sits beside one raised twelve times — read it with "
+             "the mention counts above.")
+
+        st.markdown("#### Whose measures draw discussion")
+        owner_rows = filtered[~filtered["Owner"].isin(["Not applicable"]) & filtered["Owner"].notna()]
+        if len(owner_rows):
+            own_stance = owner_rows.groupby(["Owner", "Stance"]).size().reset_index(name="count")
+            show(stance_hbar(own_stance, "Owner", "Measure owners, by the stance taken towards them",
+                             xlabel="interactions"), "meas_owner")
+
+        if len(contested):
+            st.markdown("#### Most contested measures")
+            disp = contested.reset_index().rename(columns={
+                "Measure": "Measure", "mentions": "Mentions",
+                "apprehension": "Apprehension", "share": "Apprehension %"})
+            st.dataframe(disp, width="stretch", hide_index=True)
+
+# ======================================================================================
+# FRAMING
+# ======================================================================================
+with tab_frame:
+    st.subheader("The grounds members argue on")
+
+    if T.empty:
+        note("No governance topics recorded for the rows in this view.")
+    else:
+        dim_counts = T["Dimension"].value_counts()
+        topic_counts = T["Topic"].value_counts()
+        per_row = T.groupby("Row_ID").size()
+
+        legal = T[T["Dimension"] == "Legal"]["Row_ID"].nunique()
+        readout(
+            f"Members frame these interventions along <b>{T['Dimension'].nunique()}</b> governance "
+            f"dimensions and <b>{T['Topic'].nunique()}</b> topics, averaging "
+            f"<b>{per_row.mean():.1f}</b> topics per interaction. "
+            f"<b>{dim_counts.index[0]}</b> dominates ({pcs(int(dim_counts.iloc[0]), int(dim_counts.sum()))} "
+            f"of topic mentions), and the single most common ground is "
+            f"<b>{topic_counts.index[0]}</b> ({int(topic_counts.iloc[0])} mentions). "
+            f"<b>{legal}</b> interactions ({pcs(legal, len(filtered))}) argue at least partly on legal "
+            f"grounds — WTO consistency, transparency or due process.{small_n(filtered)}"
         )
 
+        c1, c2 = st.columns([2, 3])
+        show(hbar(vc(T["Dimension"]), "Governance dimensions", xlabel="mentions"), "fr_dim", c1)
+        show(hbar(vc(T["Topic"]), "Governance topics", xlabel="mentions"), "fr_topic", c2)
+
+        topic_stance = T.groupby(["Topic", "Stance"]).size().reset_index(name="count")
+        show(stance_hbar(topic_stance, "Topic", "Stance by governance topic", normalise=True),
+             "fr_topic_stance")
+        note("Topics are capped at three per interaction and ordered by relevance, per the rule "
+             "adopted in the issues log.")
+
+        if T["Forum"].nunique() > 1:
+            mat = pd.crosstab(T["Topic"], T["Forum"])
+            mat = mat.loc[mat.sum(axis=1).sort_values(ascending=False).index]
+            show(heatmap(mat, "Which grounds are used in which body",
+                         height=max(320, 28 * len(mat) + 140), xlab="WTO body", ylab="topic"),
+                 "fr_matrix")
 
 # ======================================================================================
-# EXPLORER
+# DATA & METHOD
 # ======================================================================================
-with tab_exp:
-    ai_summary("The full filtered dataset. Search across every field, scan the records, and "
-               f"download the current <b>{len(filtered)}-row</b> view as CSV for your own analysis.")
-    search = st.text_input("Search all columns")
-    table = filtered.copy()
+with tab_data:
+    st.subheader("Reference tables and downloads")
+
+    # --- summary reference tables ------------------------------------------------------
+    measure_ref = (M.assign(is_app=M["Stance"] == "Apprehension",
+                            is_def=M["Stance"] == "Defence/Explanation")
+                   .groupby(["Measure_Group", "Measure"])
+                   .agg(Mentions=("Row_ID", "nunique"),
+                        Members=("Member", "nunique"),
+                        Apprehension=("is_app", "sum"),
+                        Defence=("is_def", "sum"),
+                        Bodies=("Forum", lambda s: ", ".join(sorted(set(s)))),
+                        First=("Date", "min"),
+                        Last=("Date", "max"))
+                   .reset_index()
+                   .sort_values(["Mentions", "Measure"], ascending=[False, True]))
+    owner_map = (M.groupby("Measure")["Owner"]
+                 .agg(lambda s: s.dropna().mode().iloc[0] if s.dropna().size else ""))
+    measure_ref.insert(2, "Owner", measure_ref["Measure"].map(owner_map).fillna(""))
+    measure_ref["First"] = pd.to_datetime(measure_ref["First"]).dt.strftime("%d %b %Y")
+    measure_ref["Last"] = pd.to_datetime(measure_ref["Last"]).dt.strftime("%d %b %Y")
+
+    member_ref = (filtered.assign(one=1)
+                  .pivot_table(index="Member", columns="Stance", values="one",
+                               aggfunc="sum", fill_value=0)
+                  .reindex(columns=STANCE_ORDER, fill_value=0)
+                  .assign(Total=lambda x: x.sum(axis=1))
+                  .sort_values("Total", ascending=False)
+                  .reset_index())
+    member_ref["Bodies"] = member_ref["Member"].map(
+        filtered.groupby("Member")["Forum"].agg(lambda s: ", ".join(sorted(set(s)))))
+    member_ref["Documents"] = member_ref["Member"].map(
+        filtered.groupby("Member")["Document_Symbol"].nunique())
+
+    which = st.radio("Reference table", ["Measures", "Members"], horizontal=True, key="ref_pick")
+    table = measure_ref if which == "Measures" else member_ref
+    st.dataframe(table, width="stretch", hide_index=True, height=340)
+    note("Both tables reflect the current filters.")
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.download_button("Measure summary (CSV)", measure_ref.to_csv(index=False),
+                       "measure_summary.csv", "text/csv", width="stretch", key="dl_meas")
+    d2.download_button("Member summary (CSV)", member_ref.to_csv(index=False),
+                       "member_summary.csv", "text/csv", width="stretch", key="dl_mem")
+    d3.download_button("Filtered rows (CSV)", filtered.drop(columns=["Rule_Codes"]).to_csv(index=False),
+                       "filtered_interactions.csv", "text/csv", width="stretch", key="dl_rows")
+    if not vocab.empty:
+        d4.download_button("Data dictionary (CSV)", vocab.to_csv(index=False),
+                           "data_dictionary.csv", "text/csv", width="stretch", key="dl_dict")
+
+    st.markdown("---")
+
+    # --- coding quality ----------------------------------------------------------------
+    st.markdown("#### Coding quality of the rows in view")
+    q1, q2, q3 = st.columns(3)
+    if "Confidence" in filtered.columns:
+        conf = vc(filtered["Confidence"])
+        fig = px.pie(conf, names="label", values="count", hole=.55, title="Coder confidence",
+                     color="label",
+                     color_discrete_map={"High": "#5C8A4A", "Medium": "#B0894A", "Low": "#C1662F"})
+        fig.update_layout(height=290)
+        show(fig, "q_conf", q1)
+    if "Security_Relevance" in filtered.columns:
+        show(hbar(vc(filtered["Security_Relevance"]), "Security relevance", xlabel="interactions",
+                  height=290), "q_rel", q2)
+    rules = filtered.explode("Rule_Codes")["Rule_Codes"].dropna()
+    if len(rules):
+        show(hbar(vc(rules), "Inclusion rules triggered", xlabel="interactions", height=290),
+             "q_rule", q3)
+        q3.caption("A row can satisfy several selection rules; R-codes follow Selection_Criteria.docx.")
+
+    # --- vocabularies -------------------------------------------------------------------
+    if not vocab.empty:
+        with st.expander("Controlled vocabulary (permitted values by field)"):
+            st.dataframe(vocab, width="stretch", hide_index=True)
+
+    # --- measure grouping transparency ---------------------------------------------------
+    with st.expander("How measures are grouped into families"):
+        mapping = (measures_long(df)[["Measure", "Measure_Group"]]
+                   .drop_duplicates().sort_values(["Measure_Group", "Measure"]))
+        st.dataframe(mapping, width="stretch", hide_index=True, height=300)
+        st.download_button("Measure family mapping (CSV)", mapping.to_csv(index=False),
+                           "measure_family_mapping.csv", "text/csv", key="dl_map")
+        st.caption(
+            "Grouping runs in the app on keyword rules, applied in order, so the first matching "
+            "family wins. To fix any assignment permanently, add a `Measure_Group` column to the "
+            "Database sheet — the app will use it in preference to these rules."
+        )
+
+    # --- issues log ------------------------------------------------------------------------
+    if not issues.empty:
+        with st.expander(f"Issues log ({len(issues)} entries)"):
+            sev = st.multiselect("Severity", sorted(issues["Severity"].dropna().unique()),
+                                 key="iss_sev")
+            view = issues[issues["Severity"].isin(sev)] if sev else issues
+            st.dataframe(view, width="stretch", hide_index=True, height=340)
+
+    # --- row explorer ---------------------------------------------------------------------
+    st.markdown("#### Interaction records")
+    search = st.text_input("Search summaries, measures and members", key="explore_q",
+                           placeholder="e.g. rare earths, semiconductors, transparency")
+    cols_show = [c for c in ["Date", "Document_Symbol", "Forum", "Member", "Stance",
+                             "Measure 1", "Measure 2", "Owner", "Security_SubDomain_1",
+                             "Interaction_Summary"] if c in filtered.columns]
+    rows = filtered[cols_show].copy()
     if search:
-        mask = table.astype(str).apply(lambda s: s.str.contains(search, case=False, na=False))
-        table = table[mask.any(axis=1)]
-    st.caption(f"Showing {len(table)} rows.")
-    st.dataframe(table, width="stretch", height=620, hide_index=True)
-    st.download_button("⬇️ Download filtered data (CSV)", table.to_csv(index=False),
-                       "trade_governance_lab.csv", "text/csv", width="stretch", key="dl_btn")
+        mask = rows.apply(lambda r: search.lower() in " ".join(map(str, r.values)).lower(), axis=1)
+        rows = rows[mask]
+    rows = rows.sort_values("Date", ascending=False)
+    rows["Date"] = pd.to_datetime(rows["Date"]).dt.strftime("%d %b %Y")
+    st.caption(f"{len(rows)} record{'s' if len(rows) != 1 else ''} shown.")
+    st.dataframe(rows, width="stretch", hide_index=True, height=420)
+
+st.markdown(
+    f"<div class='note' style='margin-top:28px;border-top:1px solid {RULE};padding-top:10px;'>"
+    f"Source: {wb.name} · Domain in scope: {DOMAIN} · Summaries are generated from the rows in view, "
+    "not from a language model.</div>",
+    unsafe_allow_html=True,
+)
