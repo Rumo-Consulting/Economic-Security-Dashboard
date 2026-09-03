@@ -1337,9 +1337,4 @@ with tab_data:
 
     records_panel("data", filtered)
 
-st.markdown(
-    f"<div class='note' style='margin-top:26px;border-top:1px solid {RULE};padding-top:10px;'>"
-    f"Source: {wb.name} · Scope: {DOMAIN} · Last updated {LAST_UPDATED} · Summaries are written from "
-    "the records in view, not by a language model.</div>",
-    unsafe_allow_html=True,
-)
+
