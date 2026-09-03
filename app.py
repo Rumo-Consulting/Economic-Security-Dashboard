@@ -15,8 +15,8 @@ Design rules held throughout:
 
 THE WORKBOOK LEADS, THE CODE FOLLOWS
   * Sheet names and column headers are matched loosely. "Governance Topic 2",
-    "Gov Topic 2" and "governance_topic_2" all fill the same role. The Data & method tab
-    shows exactly which sheet column filled which role.
+    "Gov Topic 2" and "governance_topic_2" all fill the same role. COLMAP records exactly
+    which sheet column filled which role.
   * Stance values, their order and their colours are read off the Vocabularies sheet.
     Add, rename or reorder a stance there and the whole dashboard follows.
   * Governance dimensions, and which dimension each topic belongs to, come from the
@@ -1002,8 +1002,8 @@ A = areas_long(filtered)
 T = topics_long(filtered)
 NAMED = M[M["Measure"] != UNSPECIFIED]
 
-tab_over, tab_mem, tab_meas, tab_args, tab_data = st.tabs(
-    ["Overview", "Members", "Measures", "Arguments", "Data & method"]
+tab_over, tab_mem, tab_meas, tab_args = st.tabs(
+    ["Overview", "Members", "Measures", "Arguments"]
 )
 
 # ======================================================================================
@@ -1017,8 +1017,7 @@ with tab_over:
             f"""
 - **One record = one intervention** — a single member speaking once on a single agenda item.
 - **Each tab answers one question.** *Overview* — what is in the data. *Members* — who speaks.
-  *Measures* — what is discussed. *Arguments* — the grounds they argue on. *Data & method* — how
-  the dataset was built.
+  *Measures* — what is discussed. *Arguments* — the grounds they argue on.
 - **The colours never change their meaning:** {colour_key}.
 - **Filters are on the left** and apply everywhere. Every tab opens with a summary written from
   whatever is currently in view, and closes with the records behind it.
@@ -1196,7 +1195,6 @@ with tab_args:
         st.info("No argument grounds recorded for these records.")
     else:
         t_counts = T["Topic"].value_counts()
-        primary = T[T["Slot"] == 1]
         avg_grounds = round(len(T) / T["Row_ID"].nunique(), 1)
 
         legal_line = ""
@@ -1218,11 +1216,6 @@ with tab_args:
         note("All three coded grounds count here. A member usually argues on more than one at once, "
              "so an intervention can appear in several bars.")
 
-        if not primary.empty:
-            show(hbar(vc(primary["Topic"]), "Which ground comes first?", "interventions"), "arg_primary")
-            note("The first-coded ground is the principal one — this chart uses <b>Governance Topic 1</b> "
-                 "only, so each intervention appears exactly once.")
-
         show(hbar(vc(T["Dimension"]), "Grouped into broad dimensions", "interventions", height=320),
              "arg_dim")
 
@@ -1237,104 +1230,3 @@ with tab_args:
                                "governance_topics.csv", "text/csv", key="dl_gov")
 
     records_panel("args", filtered)
-
-# ======================================================================================
-# DATA & METHOD — how the dataset was built
-# ======================================================================================
-with tab_data:
-    lead("Where the records come from, what the terms mean, and how much to trust them.")
-
-    if not vocab.empty:
-        with st.expander("What the terms mean"):
-            st.dataframe(vocab, width="stretch", hide_index=True)
-            st.download_button("Download the data dictionary (CSV)", vocab.to_csv(index=False),
-                               "data_dictionary.csv", "text/csv", key="dl_dict")
-
-    # Which sheet column filled which role. Open this first if a chart looks empty.
-    with st.expander(f"How the workbook was read ({len(COLMAP)} columns matched)"):
-        st.caption(f"Sheets used — data: **{SHEETS['Database']}**; "
-                   f"vocabulary: **{SHEETS['Vocabularies'] or 'none found'}**; "
-                   f"issues log: **{SHEETS['Issues_Log'] or 'none found'}**.")
-        cmap = pd.DataFrame({"Column in the workbook": list(COLMAP),
-                             "Read by the dashboard as": [COLMAP[c] for c in COLMAP]})
-        renamed = [a for a, b in zip(cmap["Column in the workbook"],
-                                     cmap["Read by the dashboard as"]) if norm(a) != norm(b)]
-        st.dataframe(cmap, width="stretch", hide_index=True, height=300)
-        if renamed:
-            st.caption(f"{len(renamed)} column(s) matched under a heading different from the "
-                       "dashboard's own name for the role — that is expected and fine: "
-                       + ", ".join(f"`{c}`" for c in renamed) + ".")
-        if UNUSED_COLS:
-            st.caption("Present in the sheet but not used by any chart: "
-                       + ", ".join(f"`{c}`" for c in UNUSED_COLS) + ".")
-
-    # How the stance values were read, and what colour each one was given.
-    with st.expander("How the stance values were read"):
-        srows = pd.DataFrame({
-            "Stance as written in the workbook": STANCE_ORDER,
-            "Read as": [STANCE_ROLES.get(s) or "not recognised — charted, but counted as neither "
-                                               "a concern nor a defence" for s in STANCE_ORDER],
-            "Records": [int((df["Stance"] == s).sum()) for s in STANCE_ORDER],
-        })
-        st.dataframe(srows, width="stretch", hide_index=True)
-        st.caption("Order comes from the Vocabularies sheet; the colour follows the reading. "
-                   "Concern totals count " + joined(CONCERN_STANCES, 5) + "; defence totals count "
-                   + (joined(DEFENCE_STANCES, 5) if DEFENCE_STANCES else "nothing") + ".")
-
-    # A standing check that the governance labels in the Database still match the
-    # controlled vocabulary. Nothing is corrected here — drift is reported, not hidden.
-    permitted = vocab_pairs(vocab)
-    if permitted and not GOV_ALL.empty:
-        allowed = {(d_, t_) for d_, t_ in permitted}
-        used = (GOV_ALL.groupby(["Dimension", "Topic"]).size()
-                .reset_index(name="Rows").sort_values("Rows", ascending=False))
-        drift = used[[(r.Dimension, r.Topic) not in allowed for r in used.itertuples()]]
-        unused_pairs = [f"{d_}: {t_}" for d_, t_ in permitted
-                        if (d_, t_) not in set(zip(GOV_ALL["Dimension"], GOV_ALL["Topic"]))]
-        label = ("Vocabulary check: governance labels"
-                 + (f" — {len(drift)} to review" if len(drift) else " — clean"))
-        with st.expander(label):
-            if len(drift):
-                st.markdown("**Used in the Database but not listed in the Vocabularies sheet.** "
-                            "These are counted as they stand — the app does not rename them. Either "
-                            "add them to the Vocabularies sheet or map them in `TOPIC_FIXES` at the "
-                            "top of `app.py`.")
-                st.dataframe(drift.rename(columns={"Topic": "Topic as coded"}),
-                             width="stretch", hide_index=True)
-            else:
-                st.success("Every governance label in the Database appears in the Vocabularies sheet.")
-            if unused_pairs:
-                st.caption("Listed as permitted but never used: " + "; ".join(unused_pairs) + ".")
-
-    with st.expander("How measures are grouped into families"):
-        mapping = (measures_long(df)[["Measure", "Measure_Group"]]
-                   .drop_duplicates().sort_values(["Measure_Group", "Measure"])
-                   .rename(columns={"Measure_Group": "Family"}))
-        st.dataframe(mapping, width="stretch", hide_index=True, height=280)
-        st.download_button("Download the mapping (CSV)", mapping.to_csv(index=False),
-                           "measure_families.csv", "text/csv", key="dl_map")
-        st.caption("Grouping runs in the app on keyword rules. To fix an assignment permanently, add "
-                   "a `Measure_Group` column to the Database sheet — the app will use it instead.")
-
-    with st.expander("How confident is the coding?"):
-        q1, q2 = st.columns(2)
-        if "Confidence" in filtered.columns:
-            conf = vc(filtered["Confidence"])
-            fig = px.pie(conf, names="label", values="count", hole=.55, title="Coder confidence",
-                         color="label", color_discrete_map=CONF_COLORS)
-            fig.update_layout(height=300, margin=dict(t=56, b=20, l=10, r=10))
-            show(fig, "q_conf", q1)
-        if "Security_Relevance" in filtered.columns:
-            core = int((filtered["Security_Relevance"] == CORE_VALUE).sum())
-            q2.metric(f"Security is the {str(CORE_VALUE).lower()} issue", pcs(core, len(filtered)),
-                      help="The rest touch on security as context rather than as the point of the "
-                           "intervention. Filter to these records only under More filters.")
-            q2.caption(f"{core} of {len(filtered)} records in view.")
-
-    if not issues.empty:
-        with st.expander(f"Known issues in the dataset ({len(issues)})"):
-            st.dataframe(issues, width="stretch", hide_index=True, height=300)
-
-    records_panel("data", filtered)
-
-
