@@ -1,21 +1,38 @@
 """
-Trade Governance Lab — National & Economic Security in the WTO.
+Economic Security Dashboard — Trade Law Observatory.
 
-Simplified build. Design rules held throughout:
+National & economic security in the WTO.
+
+Design rules held throughout:
   * One tab answers one question. One chart answers one sub-question, and its title IS
     that question in plain English.
   * Four filters on the left, all optional. Everything else lives behind "More filters".
   * No sliders or toggles inside the tabs — sensible defaults are chosen for the reader.
-  * Stance is the colour language: Apprehension ochre, Defence teal, Proposal olive,
-    General Statement slate. Same meaning in every chart.
+  * Stance is the colour language: concern ochre, defence teal, proposal olive,
+    general statement slate. Same meaning in every chart.
   * Summaries are computed from the rows in view — no API key, no network call, and they
     cannot state a number the data does not contain.
 
-Reads Database_v21.xlsx (sheets: Database, Vocabularies, Issues_Log).
+THE WORKBOOK LEADS, THE CODE FOLLOWS
+  * Sheet names and column headers are matched loosely. "Governance Topic 2",
+    "Gov Topic 2" and "governance_topic_2" all fill the same role. The Data & method tab
+    shows exactly which sheet column filled which role.
+  * Stance values, their order and their colours are read off the Vocabularies sheet.
+    Add, rename or reorder a stance there and the whole dashboard follows.
+  * Governance dimensions, and which dimension each topic belongs to, come from the
+    Vocabularies sheet too.
+  * Governance coding uses the paired columns Governance Dimension 1/2/3 +
+    Governance Topic 1/2/3. The older single "Governance_Dimensions_Topics" column is
+    still understood if the pairs are absent.
+
+Files expected in the same folder as this script:
+    WTO_Database.xlsx      the data
+    TLO_Logo_web.png       the masthead logo (optional — the app runs without it)
 """
 
 from __future__ import annotations
 
+import base64
 import re
 from pathlib import Path
 
@@ -27,9 +44,8 @@ import streamlit as st
 # ======================================================================================
 # Config and theme
 # ======================================================================================
-st.set_page_config(page_title="Trade Governance Lab", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Economic Security Dashboard", page_icon="🛡️", layout="wide")
 
-UNSPECIFIED = "Unspecified Measure"
 TOP_N = 12                      # fixed everywhere, so no "how many to show" control is needed
 CONTEST_FLOOR = 3               # minimum mentions before a measure enters the concern ranking
 
@@ -37,6 +53,7 @@ CONTEST_FLOOR = 3               # minimum mentions before a measure enters the c
 # first and last dates that happen to appear in the rows — edit it when the coverage extends.
 PERIOD_FROM = "01 Jan 2026"
 PERIOD_TO = "15 Aug 2026"
+LAST_UPDATED = "03 Sep 2026"    # edit this line whenever the workbook is refreshed
 
 INK = "#16232E"
 PRIMARY = "#2C5F7C"
@@ -44,20 +61,6 @@ MUTED = "#5F6E78"
 RULE = "#DBE2E6"
 BAR = "#4A7E9B"
 CONCERN = "#C1662F"
-
-STANCE_ORDER = ["Apprehension", "Defence/Explanation", "Proposal/Recommendation", "General Statement"]
-STANCE_COLORS = {
-    "Apprehension": "#C1662F",
-    "Defence/Explanation": "#2F7E8C",
-    "Proposal/Recommendation": "#5C8A4A",
-    "General Statement": "#8B99A6",
-}
-STANCE_PLAIN = {
-    "Apprehension": "raising a concern",
-    "Defence/Explanation": "defending or explaining a measure",
-    "Proposal/Recommendation": "proposing something",
-    "General Statement": "making a general statement",
-}
 HEAT_SCALE = ["#F5F7F8", "#CBDBE3", "#93B8C9", "#5A8FA8", "#2C5F7C"]
 PCONF = {"displayModeBar": False, "responsive": True}
 
@@ -98,6 +101,133 @@ MEASURE_GROUPS: list[tuple[str, list[str]]] = [
      [r"^unspecified", r"^unilateral measures$", r"^tariff and non-tariff"]),
 ]
 
+
+# ======================================================================================
+# Matching workbook labels to the roles the dashboard needs
+# --------------------------------------------------------------------------------------
+# Nothing below compares a workbook label with "==" against a hard-coded string. Sheet
+# names, column headers and controlled values are all matched loosely, so renaming a
+# heading or a permitted value in the workbook does not silently empty a chart.
+# ======================================================================================
+def norm(text) -> str:
+    """Lower-case, strip punctuation and underscores, collapse spaces."""
+    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+
+def tokens(text) -> set[str]:
+    return set(norm(text).split())
+
+
+SHEET_ALIASES: dict[str, list[str]] = {
+    "Database": ["database", "data", "records", "interventions", "main", "coding"],
+    "Vocabularies": ["vocabularies", "vocabulary", "vocab", "dictionary", "data dictionary",
+                     "terms", "codebook"],
+    "Issues_Log": ["issues log", "issues", "issue log", "known issues", "log", "review log"],
+}
+
+# canonical role | other spellings | words every candidate header must contain | essential?
+COLUMN_SPEC: list[tuple[str, list[str], set[str], bool]] = [
+    ("Document_Symbol", ["document", "doc symbol", "symbol", "document ref", "source document"],
+     {"document"}, True),
+    ("Date", ["meeting date", "date of meeting"], {"date"}, True),
+    ("Title", ["document title"], {"title"}, False),
+    ("WTO_Forum", ["forum", "wto body", "body", "committee", "council", "venue"], {"forum"}, True),
+    ("Participant", ["member", "speaker", "delegation", "member speaking", "intervening member"],
+     {"participant"}, True),
+    ("Agenda_Item", ["agenda", "item", "agenda number"], {"agenda"}, False),
+    ("Reference_Paragraph", ["reference para", "paragraph", "para", "reference", "cite"],
+     {"reference"}, False),
+    ("Stance", ["engagement", "position", "type of intervention", "intervention type"],
+     {"stance"}, True),
+    ("Domain", ["scope", "policy domain"], {"domain"}, False),
+    ("Measure 1", ["measure", "measure one", "primary measure", "measure a"], {"measure", "1"}, False),
+    ("Measure 2", ["measure two", "secondary measure", "measure b"], {"measure", "2"}, False),
+    ("Measure 3", ["measure three", "measure c"], {"measure", "3"}, False),
+    ("Measure_Owner", ["owner", "measure owner", "owner of measure", "responding member"],
+     {"measure", "owner"}, False),
+    ("Security_SubDomain_1", ["security subdomain 1", "security sub domain 1", "sub domain 1",
+                              "security area 1", "subdomain 1", "security domain 1"],
+     {"security", "1"}, False),
+    ("Security_SubDomain_2", ["security subdomain 2", "security sub domain 2", "sub domain 2",
+                              "security area 2", "subdomain 2", "security domain 2"],
+     {"security", "2"}, False),
+    ("Governance Dimension 1", ["gov dimension 1", "governance dimension one", "dimension 1"],
+     {"dimension", "1"}, False),
+    ("Governance Dimension 2", ["gov dimension 2", "governance dimension two", "dimension 2"],
+     {"dimension", "2"}, False),
+    ("Governance Dimension 3", ["gov dimension 3", "governance dimension three", "dimension 3"],
+     {"dimension", "3"}, False),
+    ("Governance Topic 1", ["gov topic 1", "governance topic one", "topic 1"], {"topic", "1"}, False),
+    ("Governance Topic 2", ["gov topic 2", "governance topic two", "topic 2"], {"topic", "2"}, False),
+    ("Governance Topic 3", ["gov topic 3", "governance topic three", "topic 3"], {"topic", "3"}, False),
+    ("Governance_Dimensions_Topics", ["governance dimensions topics", "governance topics",
+                                      "governance dimension topics"], set(), False),
+    ("Interaction_Summary", ["summary", "what was said", "interaction", "intervention summary"],
+     {"summary"}, False),
+    ("Confidence", ["coder confidence", "confidence level"], {"confidence"}, False),
+    ("Security_Relevance", ["relevance", "security relevance", "centrality"], {"relevance"}, False),
+    ("Inclusion_Rule", ["inclusion", "rule"], {"inclusion"}, False),
+    ("Review_Status", ["review status", "status"], {"review", "status"}, False),
+    ("Review_Notes", ["review notes", "notes", "coder notes"], {"review", "notes"}, False),
+]
+
+VOCAB_FIELD_ALIASES: dict[str, list[str]] = {
+    "Stance": ["stance", "engagement", "position"],
+    "Security_Relevance": ["security relevance", "relevance"],
+    "Confidence": ["confidence"],
+    "Dimension": ["governance dimension", "dimension"],
+    "Topic": ["governance topic", "governance dimensions topics", "topic"],
+    "Security_SubDomain": ["security subdomain", "security sub domain", "subdomain", "security area"],
+}
+
+# How a stance NAME is read, whatever it is called. First rule that matches wins, so the
+# order of this list is the order of precedence.
+STANCE_ROLE_RULES: list[tuple[str, list[str]]] = [
+    ("concern", ["apprehension", "objection", "criticism", "concern", "complaint", "opposition"]),
+    ("defence", ["defence", "defense", "explanation", "justification", "rebuttal", "reply",
+                 "response", "support"]),
+    ("proposal", ["proposal", "recommendation", "suggestion", "request"]),
+    ("general", ["general", "statement", "information", "sharing", "factual", "update", "note"]),
+]
+# Shades within a role, so two kinds of concern both stay recognisably ochre.
+ROLE_SHADES: dict[str, list[str]] = {
+    "concern": ["#C1662F", "#9C4F24"],
+    "defence": ["#2F7E8C", "#245F6A"],
+    "proposal": ["#5C8A4A", "#456A37"],
+    "general": ["#8B99A6", "#AEB8C2"],
+}
+ROLE_PLAIN: dict[str, str] = {
+    "concern": "raising a concern",
+    "defence": "defending or explaining a measure",
+    "proposal": "proposing something",
+    "general": "making a general statement",
+}
+SPARE_COLORS = ["#8B6BA8", "#B0894A", "#4A7E9B", "#7A8B57", "#A8646E"]
+
+# Fallbacks, used only where the Vocabularies sheet is silent.
+GOV_DIMENSIONS_DEFAULT = ["Legal", "Economic", "Development", "Institutional", "Political Economy"]
+TOPIC_PARENT_DEFAULT: dict[str, str] = {
+    "WTO Consistency & Legal Interpretation": "Legal",
+    "Transparency & Due Process": "Legal",
+    "Market Access & Trade Effects": "Economic",
+    "Competitiveness": "Economic",
+    "Supply Chain & Economic Resilience": "Economic",
+    "Supply Chain Impact": "Economic",
+    "Policy Space": "Development",
+    "Developmental & Distributional Effects": "Development",
+    "International Cooperation": "Institutional",
+    "Cooperation & Coordination": "Institutional",
+    "Institutional Capacity & Coordination": "Institutional",
+    "Economic Security & Strategic Autonomy": "Political Economy",
+}
+
+# Spelling repairs applied before anything is counted. Left side = what is in the
+# workbook, right side = what to count it as. Empty, because the corrections now live in
+# the workbook itself, which is where they belong.
+TOPIC_FIXES: dict[str, str] = {
+    # "Old label as typed": "Label to count it as",
+}
+
 pio.templates["tgl"] = pio.templates["plotly_white"]
 pio.templates["tgl"].layout.update(
     colorway=[PRIMARY, CONCERN, "#5C8A4A", "#8B6BA8", "#2F7E8C", "#B0894A"],
@@ -127,9 +257,13 @@ st.markdown(
       }}
       h1, h2, h3, h4 {{ font-family: 'Source Serif 4', Georgia, serif; color: {INK};
                         letter-spacing: -0.01em; }}
-      .block-container {{ padding-top: 3.2rem; padding-bottom: 3rem; max-width: 1280px; }}
+      .block-container {{ padding-top: 2.4rem; padding-bottom: 3rem; max-width: 1280px; }}
 
       .masthead {{ border-bottom: 2px solid {INK}; padding: 6px 0 14px 0; margin-bottom: 4px; }}
+      /* The logo is sized in viewport units so it stays legible on a phone and never
+         outgrows the headline on a desktop screen. */
+      .masthead .logo {{ display:block; width:100%; max-width:min(400px, 66vw); height:auto;
+                         margin:0 0 16px 0; }}
       .masthead .eyebrow {{ font-family:'IBM Plex Mono', monospace; font-size:.7rem; font-weight:600;
                             letter-spacing:.16em; text-transform:uppercase; color:{PRIMARY};
                             line-height:1.9; }}
@@ -138,6 +272,8 @@ st.markdown(
       .masthead .sub {{ color:{MUTED}; font-size:1rem; max-width:none; line-height:1.5; }}
       .masthead .period {{ font-family:'IBM Plex Mono', monospace; font-size:.78rem; color:{MUTED};
                            margin-top:8px; }}
+      .masthead .updated {{ font-family:'IBM Plex Mono', monospace; font-size:.78rem; color:{MUTED};
+                            margin-top:2px; }}
 
       .strip {{ display:flex; width:100%; height:14px; border-radius:7px; overflow:hidden;
                 margin:18px 0 8px 0; border:1px solid {RULE}; }}
@@ -174,6 +310,8 @@ st.markdown(
       @media (max-width: 640px) {{
           .block-container {{ padding-left:.7rem; padding-right:.7rem; }}
           div[data-testid="stMetricValue"] {{ font-size:1.2rem; }}
+          .masthead .logo {{ max-width:80vw; margin-bottom:12px; }}
+          .masthead {{ padding-top:2px; }}
       }}
     </style>
     """,
@@ -182,17 +320,220 @@ st.markdown(
 
 
 # ======================================================================================
-# Data
+# Files
 # ======================================================================================
 def find_workbook() -> Path | None:
     here = Path(__file__).parent
-    for name in ["Database_v21.xlsx", "Database.xlsx", "WTO_Database.xlsx"]:
+    for name in ["WTO_Database.xlsx", "Database_v21.xlsx", "Database.xlsx"]:
         if (here / name).exists():
             return here / name
-    matches = sorted(here.glob("Database*.xlsx"))
+    matches = sorted(p for p in here.glob("*.xlsx") if not p.name.startswith("~$"))
     return matches[-1] if matches else None
 
 
+def find_logo() -> Path | None:
+    here = Path(__file__).parent
+    for name in ["TLO_Logo_web.png", "TLO_Logo.png", "logo.png"]:
+        if (here / name).exists():
+            return here / name
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def logo_uri(path_str: str, mtime: float) -> str:
+    data = base64.b64encode(Path(path_str).read_bytes()).decode()
+    return f"data:image/png;base64,{data}"
+
+
+# ======================================================================================
+# Loading, with loose matching of sheets and headers
+# ======================================================================================
+def resolve_sheet(sheet_names: list[str], role: str) -> str | None:
+    aliases = {norm(a) for a in SHEET_ALIASES.get(role, [])} | {norm(role)}
+    for name in sheet_names:                       # exact, once punctuation is ignored
+        if norm(name) in aliases:
+            return name
+    for name in sheet_names:                       # loose, so "Database v22" still lands
+        n = norm(name)
+        if any(a and (n.startswith(a) or a in n) for a in aliases):
+            return name
+    return None
+
+
+def resolve_columns(headers: list[str]) -> tuple[dict[str, str], list[str]]:
+    """Work out which sheet header plays which role.
+
+    Returns {header: role} plus any essential role that could not be filled.
+    """
+    mapping: dict[str, str] = {}
+    taken: set[str] = set()
+    filled: set[str] = set()
+
+    def claim(header: str, role: str):
+        mapping[header] = role
+        taken.add(header)
+        filled.add(role)
+
+    # Pass 1 — the header IS the role name, give or take case and punctuation.
+    for role, _aliases, _req, _ess in COLUMN_SPEC:
+        if role in filled:
+            continue
+        for h in headers:
+            if h not in taken and norm(h) == norm(role):
+                claim(h, role)
+                break
+
+    # Pass 2 — the header is a known alternative spelling.
+    for role, aliases, _req, _ess in COLUMN_SPEC:
+        if role in filled:
+            continue
+        wanted = {norm(a) for a in aliases}
+        for h in headers:
+            if h not in taken and norm(h) in wanted:
+                claim(h, role)
+                break
+
+    # Pass 3 — the header simply contains the words that identify the role, so
+    # "Gov Topic 2" and "governance_topic_2" both land on Governance Topic 2.
+    for role, _aliases, required, _ess in COLUMN_SPEC:
+        if role in filled or not required:
+            continue
+        for h in headers:
+            if h not in taken and required <= tokens(h):
+                claim(h, role)
+                break
+
+    missing = [role for role, _a, _r, essential in COLUMN_SPEC if essential and role not in filled]
+    return mapping, missing
+
+
+@st.cache_data(show_spinner=False)
+def load_data(path_str: str, mtime: float):
+    xl = pd.ExcelFile(path_str)
+    names = list(xl.sheet_names)
+
+    db_sheet = resolve_sheet(names, "Database") or names[0]
+    voc_sheet = resolve_sheet(names, "Vocabularies")
+    iss_sheet = resolve_sheet(names, "Issues_Log")
+    sheets = {"Database": db_sheet, "Vocabularies": voc_sheet, "Issues_Log": iss_sheet}
+
+    df = pd.read_excel(xl, sheet_name=db_sheet)
+    df.columns = [str(c).strip() for c in df.columns]
+    vocab = pd.read_excel(xl, sheet_name=voc_sheet) if voc_sheet else pd.DataFrame()
+    issues = pd.read_excel(xl, sheet_name=iss_sheet) if iss_sheet else pd.DataFrame()
+    if not vocab.empty:
+        vocab.columns = [str(c).strip() for c in vocab.columns]
+
+    colmap, missing = resolve_columns(list(df.columns))
+    unused = [c for c in df.columns if c not in colmap]
+    df = df.rename(columns=colmap)
+    if missing:
+        return df, vocab, issues, colmap, unused, missing, sheets
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Row_ID"] = range(len(df))
+    df["Body"] = df["WTO_Forum"].map(FORUM_SHORT).fillna(df["WTO_Forum"])
+    df["Member"] = df["Participant"].map(MEMBER_SHORT).fillna(df["Participant"])
+    if "Measure_Owner" in df.columns:
+        df["Owner"] = df["Measure_Owner"].map(MEMBER_SHORT).fillna(df["Measure_Owner"])
+    else:
+        df["Owner"] = pd.NA
+    for col in ["Stance", "Security_Relevance", "Confidence"]:
+        if col in df.columns:
+            df[col] = df[col].astype("string").str.strip()
+    return df, vocab, issues, colmap, unused, missing, sheets
+
+
+# ======================================================================================
+# Reading the controlled vocabularies out of the workbook
+# ======================================================================================
+def vocab_values(vocab: pd.DataFrame, role: str) -> list[str]:
+    """Permitted values for a field, in the order the sheet lists them."""
+    if vocab.empty:
+        return []
+    fcol = next((c for c in vocab.columns if "field" in norm(c)), None)
+    vcol = next((c for c in vocab.columns if "value" in norm(c) or "permitted" in norm(c)), None)
+    if fcol is None or vcol is None:
+        return []
+    aliases = [norm(a) for a in VOCAB_FIELD_ALIASES.get(role, [norm(role)])]
+    hit = vocab[vocab[fcol].astype(str).map(lambda f: any(a in norm(f) for a in aliases))]
+    out, seen = [], set()
+    for v in hit[vcol].dropna().astype(str):
+        v = v.strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def vocab_pairs(vocab: pd.DataFrame) -> list[tuple[str, str]]:
+    """The permitted "Dimension: Topic" pairs, in sheet order."""
+    pairs = []
+    for value in vocab_values(vocab, "Topic"):
+        if ":" in value:
+            dim, topic = value.split(":", 1)
+            pairs.append((dim.strip(), topic.strip()))
+    return pairs
+
+
+def stance_role(name: str) -> str | None:
+    n = norm(name)
+    for role, words in STANCE_ROLE_RULES:
+        if any(w in n for w in words):
+            return role
+    return None
+
+
+def build_stance_config(vocab: pd.DataFrame, observed: pd.Series):
+    """Stance order, colours and plain-English phrasing, taken from the workbook.
+
+    The Vocabularies sheet sets the order. Anything appearing in the data but not listed
+    there is appended rather than dropped, so a new stance still shows up.
+    """
+    listed = vocab_values(vocab, "Stance")
+    seen = observed.dropna().astype(str).str.strip()
+    present = set(seen)
+    order = [v for v in listed if v in present] + [v for v in seen.value_counts().index
+                                                   if v not in listed]
+    if not order:
+        order = listed or list(dict.fromkeys(seen))
+
+    roles, colors, plain = {}, {}, {}
+    role_count: dict[str, int] = {}
+    spare = list(SPARE_COLORS)
+    for name in order:
+        role = stance_role(name)
+        roles[name] = role
+        if role:
+            i = role_count.get(role, 0)
+            role_count[role] = i + 1
+            shades = ROLE_SHADES[role]
+            colors[name] = shades[i] if i < len(shades) else (spare.pop(0) if spare else shades[-1])
+            plain[name] = ROLE_PLAIN[role]
+        else:
+            colors[name] = spare.pop(0) if spare else "#8B99A6"
+            plain[name] = f"making a {name.lower()} intervention"
+
+    concerns = [n for n in order if roles[n] == "concern"]
+    defences = [n for n in order if roles[n] == "defence"]
+    # If nothing reads as a concern, fall back to the most common stance so the concern
+    # charts show something rather than silently nothing.
+    if not concerns and order:
+        concerns = [order[0]]
+    return order, colors, plain, roles, concerns, defences
+
+
+def pick_value(values, patterns: list[str], default: str | None = None) -> str | None:
+    """The first value that reads like the thing we are looking for."""
+    for v in values:
+        if any(re.search(p, norm(v)) for p in patterns):
+            return v
+    return default
+
+
+# ======================================================================================
+# Reshaping
+# ======================================================================================
 def group_measure(name: str) -> str:
     if not isinstance(name, str) or not name.strip():
         return "General / unspecified"
@@ -201,25 +542,6 @@ def group_measure(name: str) -> str:
         if any(re.search(p, low) for p in patterns):
             return group
     return "Other measures"
-
-
-@st.cache_data(show_spinner=False)
-def load_data(path_str: str, mtime: float):
-    xl = pd.ExcelFile(path_str)
-    df = pd.read_excel(xl, sheet_name="Database")
-    df.columns = df.columns.str.strip()
-    vocab = pd.read_excel(xl, sheet_name="Vocabularies") if "Vocabularies" in xl.sheet_names else pd.DataFrame()
-    issues = pd.read_excel(xl, sheet_name="Issues_Log") if "Issues_Log" in xl.sheet_names else pd.DataFrame()
-
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["Row_ID"] = range(len(df))
-    df["Body"] = df["WTO_Forum"].map(FORUM_SHORT).fillna(df["WTO_Forum"])
-    df["Member"] = df["Participant"].map(MEMBER_SHORT).fillna(df["Participant"])
-    df["Owner"] = df["Measure_Owner"].map(MEMBER_SHORT).fillna(df["Measure_Owner"])
-    for col in ["Stance", "Security_Relevance", "Confidence"]:
-        if col in df.columns:
-            df[col] = df[col].astype("string").str.strip()
-    return df, vocab, issues
 
 
 def measures_long(d: pd.DataFrame) -> pd.DataFrame:
@@ -258,22 +580,86 @@ def areas_long(d: pd.DataFrame) -> pd.DataFrame:
 
 
 def topics_long(d: pd.DataFrame) -> pd.DataFrame:
-    col = "Governance_Dimensions_Topics"
+    """One row per governance ground: Row_ID, Slot (1-3), Dimension, Topic, Full.
+
+    Reads the paired columns Governance Dimension 1/2/3 + Governance Topic 1/2/3, and
+    falls back to the older single column if the pairs are absent.
+    """
     keep = ["Row_ID", "Member", "Body", "Stance"]
-    if col not in d.columns:
-        return pd.DataFrame(columns=keep + ["Dimension", "Topic"])
-    sub = d[keep + [col]].copy()
-    sub[col] = sub[col].astype("string")
-    sub = sub.dropna(subset=[col])
-    sub["Full"] = sub[col].str.split("|")
-    out = sub.explode("Full")
-    out["Full"] = out["Full"].str.strip()
-    out = out[out["Full"].str.len() > 0]
-    split = out["Full"].str.split(":", n=1, expand=True)
-    out["Dimension"] = split[0].str.strip()
-    out["Topic"] = split[1].str.strip() if split.shape[1] > 1 else split[0].str.strip()
-    out = out.drop(columns=[col]).drop_duplicates(subset=["Row_ID", "Full"])
+    empty = pd.DataFrame(columns=keep + ["Slot", "Dimension", "Topic", "Full"])
+
+    paired = [i for i in (1, 2, 3)
+              if f"Governance Topic {i}" in d.columns or f"Governance Dimension {i}" in d.columns]
+
+    parts = []
+    if paired:
+        for i in paired:
+            sub = d[keep].copy()
+            sub["Slot"] = i
+            dcol, tcol = f"Governance Dimension {i}", f"Governance Topic {i}"
+            sub["Dimension"] = d[dcol].astype("string").str.strip() if dcol in d.columns else pd.NA
+            sub["Topic"] = d[tcol].astype("string").str.strip() if tcol in d.columns else pd.NA
+            parts.append(sub)
+    elif "Governance_Dimensions_Topics" in d.columns:
+        # Legacy layout: "Legal: Transparency & Due Process | Economic: Competitiveness"
+        legacy = d[keep + ["Governance_Dimensions_Topics"]].copy()
+        legacy["Full"] = legacy["Governance_Dimensions_Topics"].astype("string").str.split("|")
+        legacy = legacy.explode("Full").dropna(subset=["Full"])
+        legacy["Full"] = legacy["Full"].str.strip()
+        legacy = legacy[legacy["Full"].str.len() > 0]
+        split = legacy["Full"].str.split(":", n=1, expand=True)
+        legacy["Dimension"] = split[0].str.strip()
+        legacy["Topic"] = split[1].str.strip() if split.shape[1] > 1 else split[0].str.strip()
+        legacy["Slot"] = legacy.groupby("Row_ID").cumcount() + 1
+        parts.append(legacy[keep + ["Slot", "Dimension", "Topic"]])
+    else:
+        return empty
+
+    out = pd.concat(parts, ignore_index=True)
+    for col in ["Dimension", "Topic"]:
+        out[col] = out[col].astype("string").str.strip().replace({"": pd.NA})
+        if TOPIC_FIXES:
+            out[col] = out[col].replace(TOPIC_FIXES)
+
+    # A topic name typed into the Dimension cell, with the Topic cell left blank, is put
+    # back where it belongs rather than silently dropped.
+    stray = out["Topic"].isna() & out["Dimension"].isin(list(TOPIC_PARENT))
+    out.loc[stray, "Topic"] = out.loc[stray, "Dimension"]
+    out.loc[stray, "Dimension"] = pd.NA
+
+    out = out.dropna(subset=["Topic"])
+
+    # A blank or unrecognised dimension is filled from the topic's parent, so the
+    # dimension chart never loses a ground it should have counted.
+    parent = out["Topic"].map(TOPIC_PARENT)
+    needs = out["Dimension"].isna() | ~out["Dimension"].isin(GOV_DIMENSIONS)
+    out.loc[needs, "Dimension"] = parent[needs].fillna(out.loc[needs, "Dimension"])
+    out["Dimension"] = out["Dimension"].fillna("Unclassified")
+
+    out["Full"] = out["Dimension"].astype(str) + ": " + out["Topic"].astype(str)
+    out = out.sort_values(["Row_ID", "Slot"]).drop_duplicates(subset=["Row_ID", "Full"])
     return out.reset_index(drop=True)
+
+
+def governance_label(d: pd.DataFrame) -> pd.Series:
+    """One readable string per record: the grounds in the order they were coded."""
+    grounds = topics_long(d)
+    if grounds.empty:
+        return pd.Series("", index=d.index, dtype="object")
+    joined_ = (grounds.sort_values(["Row_ID", "Slot"])
+               .groupby("Row_ID")["Full"].agg(lambda s: "; ".join(s)))
+    return d["Row_ID"].map(joined_).fillna("")
+
+
+def combine_cols(d: pd.DataFrame, cols: list[str], sep: str = "; ") -> pd.Series:
+    """Squash 'Measure 1/2/3' style columns into one readable cell."""
+    present = [c for c in cols if c in d.columns]
+    if not present:
+        return pd.Series("", index=d.index, dtype="object")
+    frame = d[present].astype("string")
+    return frame.apply(
+        lambda r: sep.join(v.strip() for v in r.dropna() if str(v).strip()), axis=1
+    )
 
 
 # ======================================================================================
@@ -340,26 +726,51 @@ def readout(text: str):
                 unsafe_allow_html=True)
 
 
+# The record table shown at the foot of every tab. Ten columns, in reading order:
+# when, where, who, what measure, whose measure, which security area, on what grounds,
+# and what was actually said.
+RECORD_COLUMNS: list[tuple[str, str]] = [
+    ("Date", "Date"),
+    ("Document_Symbol", "Document"),
+    ("Body", "Body"),
+    ("Reference_Paragraph", "Reference para"),
+    ("Member", "Participant"),
+    ("_Measures", "Measure"),
+    ("Owner", "Measure owner"),
+    ("_Areas", "Security sub-domain"),
+    ("_Governance", "Governance dimension & topics"),
+    ("Interaction_Summary", "Interaction summary"),
+]
+
+
+def record_table(data: pd.DataFrame) -> pd.DataFrame:
+    """The filtered rows, cut down to the ten columns a reader actually needs."""
+    rows = data.copy()
+    rows["_Measures"] = combine_cols(rows, ["Measure 1", "Measure 2", "Measure 3"])
+    rows["_Areas"] = combine_cols(rows, ["Security_SubDomain_1", "Security_SubDomain_2"], sep=" · ")
+    rows["_Governance"] = governance_label(rows)
+
+    cols = [(src, label) for src, label in RECORD_COLUMNS if src in rows.columns]
+    out = rows[[src for src, _ in cols]].copy()
+    out.columns = [label for _, label in cols]
+    if "Date" in out.columns:
+        out = out.sort_values("Date", ascending=False)
+        out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%d %b %Y")
+    return out
+
+
 def records_panel(key: str, data: pd.DataFrame):
     """The underlying rows, collapsed, at the foot of every tab."""
     with st.expander(f"See the {len(data)} records behind this view"):
         search = st.text_input("Search", key=f"q_{key}",
                                placeholder="Try: rare earths, semiconductors, transparency…")
-        cols = [c for c in ["Date", "Document_Symbol", "Body", "Member", "Stance", "Measure 1",
-                            "Owner", "Security_SubDomain_1", "Interaction_Summary"] if c in data.columns]
-        rows = data[cols].copy()
+        rows = record_table(data)
         if search:
             mask = rows.apply(lambda r: search.lower() in " ".join(map(str, r.values)).lower(), axis=1)
             rows = rows[mask]
-        rows = rows.sort_values("Date", ascending=False)
-        rows["Date"] = pd.to_datetime(rows["Date"]).dt.strftime("%d %b %Y")
-        rows = rows.rename(columns={"Document_Symbol": "Document", "Measure 1": "Measure",
-                                    "Security_SubDomain_1": "Security area",
-                                    "Interaction_Summary": "What was said"})
-        if search:
             st.caption(f"{len(rows)} of {len(data)} records match “{search}”.")
         st.dataframe(rows, width="stretch", hide_index=True, height=380)
-        st.download_button("Download these records (CSV)", data.to_csv(index=False),
+        st.download_button("Download these records (CSV)", rows.to_csv(index=False),
                            "interactions.csv", "text/csv", key=f"dl_records_{key}")
 
 
@@ -381,8 +792,9 @@ def stance_strip(d: pd.DataFrame):
         n = int(counts.get(s, 0))
         if not n:
             continue
-        bars.append(f"<div style='width:{n / total * 100:.3f}%;background:{STANCE_COLORS[s]};'></div>")
-        keys.append(f"<span><span class='dot' style='background:{STANCE_COLORS[s]}'></span>"
+        color = STANCE_COLORS.get(s, "#8B99A6")
+        bars.append(f"<div style='width:{n / total * 100:.3f}%;background:{color};'></div>")
+        keys.append(f"<span><span class='dot' style='background:{color}'></span>"
                     f"{s} <b>{n}</b> ({pcs(n, total)})</span>")
     st.markdown(f"<div class='strip'>{''.join(bars)}</div>"
                 f"<div class='strip-key'>{''.join(keys)}</div>", unsafe_allow_html=True)
@@ -426,12 +838,71 @@ def concentration_note(d: pd.DataFrame) -> str:
 # ======================================================================================
 wb = find_workbook()
 if wb is None:
-    st.error("**Workbook not found.** Put `Database_v21.xlsx` in the same folder as `app.py` and reload.")
+    st.error("**Workbook not found.** Put `WTO_Database.xlsx` in the same folder as `app.py` and reload.")
     st.stop()
 
-df, vocab, issues = load_data(str(wb), wb.stat().st_mtime)
+df, vocab, issues, COLMAP, UNUSED_COLS, MISSING_COLS, SHEETS = load_data(str(wb), wb.stat().st_mtime)
+
+if MISSING_COLS:
+    st.error(
+        "**The workbook is missing columns the dashboard cannot do without: "
+        + ", ".join(f"`{m}`" for m in MISSING_COLS) + ".**\n\n"
+        "Headings are matched loosely, so a rename is normally fine — but these roles have to stay "
+        "recognisable. Headings found in the sheet: " + ", ".join(f"`{c}`" for c in df.columns)
+    )
+    st.stop()
+
+# --- controlled values, read from the workbook rather than hard-coded ------------------
+STANCE_ORDER, STANCE_COLORS, STANCE_PLAIN, STANCE_ROLES, CONCERN_STANCES, DEFENCE_STANCES = \
+    build_stance_config(vocab, df["Stance"])
+
+GOV_DIMENSIONS = list(GOV_DIMENSIONS_DEFAULT)
+TOPIC_PARENT = dict(TOPIC_PARENT_DEFAULT)
+for _dim, _topic in vocab_pairs(vocab):            # the sheet wins wherever it speaks
+    TOPIC_PARENT[_topic] = _dim
+    if _dim not in GOV_DIMENSIONS:
+        GOV_DIMENSIONS.append(_dim)
+for _dim in vocab_values(vocab, "Dimension"):
+    if ":" not in _dim and _dim not in GOV_DIMENSIONS:
+        GOV_DIMENSIONS.append(_dim)
+
+_measure_cols = [df[c].dropna().astype(str) for c in ["Measure 1", "Measure 2", "Measure 3"]
+                 if c in df.columns]
+_measure_values = (pd.unique(pd.concat(_measure_cols)) if _measure_cols else [])
+UNSPECIFIED = pick_value(_measure_values, [r"^unspecified", r"^not specified", r"^none"],
+                         "Unspecified Measure")
+NOT_APPLICABLE = pick_value(df["Owner"].dropna().astype(str).unique(),
+                            [r"^not applicable", r"^n a$", r"^na$", r"^none$"], "Not applicable")
+CORE_VALUE = pick_value(vocab_values(vocab, "Security_Relevance")
+                        or (list(df["Security_Relevance"].dropna().astype(str).unique())
+                            if "Security_Relevance" in df.columns else []),
+                        [r"core", r"central", r"primary"], "Core")
+LEGAL_DIM = pick_value(GOV_DIMENSIONS, [r"legal", r"\blaw\b", r"juridical"])
+
+CONF_COLORS: dict[str, str] = {}
+for _v in (vocab_values(vocab, "Confidence")
+           or (list(df["Confidence"].dropna().astype(str).unique())
+               if "Confidence" in df.columns else [])):
+    _n = norm(_v)
+    CONF_COLORS[_v] = ("#5C8A4A" if "high" in _n else
+                       "#B0894A" if ("medium" in _n or "moderate" in _n) else
+                       CONCERN if "low" in _n else PRIMARY)
+
 DOMAIN = df["Domain"].dropna().iloc[0] if "Domain" in df.columns and df["Domain"].notna().any() else "—"
 COVER_FROM, COVER_TO = df["Date"].min(), df["Date"].max()
+GOV_ALL = topics_long(df)
+
+logo_path = find_logo()
+LOGO_URI = logo_uri(str(logo_path), logo_path.stat().st_mtime) if logo_path else None
+if LOGO_URI:
+    # Also pins the logo in the app header, which is where it stays visible on a phone
+    # once the page is scrolled. Delete these six lines if you want it in one place only.
+    try:
+        st.logo(str(logo_path), size="large")
+    except TypeError:
+        st.logo(str(logo_path))
+    except Exception:
+        pass
 
 # ======================================================================================
 # Filters — four in plain sight, the rest tucked away
@@ -439,7 +910,8 @@ COVER_FROM, COVER_TO = df["Date"].min(), df["Date"].max()
 st.sidebar.header("Filters")
 st.sidebar.caption("Leave a filter empty to include everything. Filters apply to every tab.")
 
-FILTER_KEYS = ["f_body", "f_member", "f_stance", "f_area", "f_group", "f_owner", "f_core", "f_dates"]
+FILTER_KEYS = ["f_body", "f_member", "f_stance", "f_area", "f_group", "f_owner",
+               "f_dim", "f_topic", "f_core", "f_dates"]
 
 f_body = st.sidebar.multiselect("WTO body", sorted(df["Body"].dropna().unique()), key="f_body")
 f_member = st.sidebar.multiselect("Member speaking", sorted(df["Member"].dropna().unique()), key="f_member")
@@ -453,7 +925,15 @@ with st.sidebar.expander("More filters"):
                              key="f_group")
     f_owner = st.multiselect("Measure owner", sorted(df["Owner"].dropna().unique()), key="f_owner",
                              help="The member whose measure is under discussion — not the speaker.")
-    core_only = st.toggle("Only records where security is the core issue", value=False, key="f_core")
+    f_dim = st.multiselect("Governance dimension",
+                           sorted(GOV_ALL["Dimension"].unique()) if not GOV_ALL.empty else [],
+                           key="f_dim")
+    f_topic = st.multiselect("Governance topic",
+                             sorted(GOV_ALL["Topic"].unique()) if not GOV_ALL.empty else [],
+                             key="f_topic",
+                             help="Any of the three grounds coded for a record, not just the first.")
+    core_only = st.toggle(f"Only records where security is the {str(CORE_VALUE).lower()} issue",
+                          value=False, key="f_core")
     picked = st.date_input("Date range", value=(COVER_FROM.date(), COVER_TO.date()),
                            min_value=COVER_FROM.date(), max_value=COVER_TO.date(), key="f_dates")
     if isinstance(picked, (list, tuple)):
@@ -472,13 +952,17 @@ if f_stance:
 if f_owner:
     filtered = filtered[filtered["Owner"].isin(f_owner)]
 if core_only and "Security_Relevance" in filtered.columns:
-    filtered = filtered[filtered["Security_Relevance"] == "Core"]
+    filtered = filtered[filtered["Security_Relevance"] == CORE_VALUE]
 if f_area:
     ids = set(areas_long(df).loc[lambda x: x["Area"].isin(f_area), "Row_ID"])
     filtered = filtered[filtered["Row_ID"].isin(ids)]
 if f_group:
     ids = set(measures_long(df).loc[lambda x: x["Measure_Group"].isin(f_group), "Row_ID"])
     filtered = filtered[filtered["Row_ID"].isin(ids)]
+if f_dim and not GOV_ALL.empty:
+    filtered = filtered[filtered["Row_ID"].isin(set(GOV_ALL.loc[GOV_ALL["Dimension"].isin(f_dim), "Row_ID"]))]
+if f_topic and not GOV_ALL.empty:
+    filtered = filtered[filtered["Row_ID"].isin(set(GOV_ALL.loc[GOV_ALL["Topic"].isin(f_topic), "Row_ID"]))]
 filtered = filtered[(filtered["Date"] >= pd.Timestamp(d_from)) & (filtered["Date"] <= pd.Timestamp(d_to))]
 
 st.sidebar.markdown("---")
@@ -493,14 +977,17 @@ if st.sidebar.button("Reset filters", width="stretch", key="reset"):
 # ======================================================================================
 # Masthead
 # ======================================================================================
+logo_html = f'<img class="logo" src="{LOGO_URI}" alt="Trade Law Observatory">' if LOGO_URI else ""
 st.markdown(
     f"""
     <div class="masthead">
-      <div class="eyebrow">WTO discussion analytics</div>
-      <h1>Trade Governance Lab</h1>
+      {logo_html}
+      <div class="eyebrow">Trade Law Observatory</div>
+      <h1>Economic Security Dashboard</h1>
       <div class="sub">How WTO members raise, defend and contest {DOMAIN.lower()} measures in the
       organisation's formal meetings.</div>
       <div class="period">Data period: {PERIOD_FROM} to {PERIOD_TO}</div>
+      <div class="updated">Last updated: {LAST_UPDATED}</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -524,14 +1011,15 @@ tab_over, tab_mem, tab_meas, tab_args, tab_data = st.tabs(
 # ======================================================================================
 with tab_over:
     with st.expander("New here? How to read this dashboard"):
+        colour_key = ", ".join(f"**{s}** is {STANCE_PLAIN.get(s, s.lower())}"
+                               for s in STANCE_ORDER[:4])
         st.markdown(
-            """
+            f"""
 - **One record = one intervention** — a single member speaking once on a single agenda item.
 - **Each tab answers one question.** *Overview* — what is in the data. *Members* — who speaks.
   *Measures* — what is discussed. *Arguments* — the grounds they argue on. *Data & method* — how
   the dataset was built.
-- **The four colours never change their meaning:** ochre is a concern being raised, teal is a
-  member defending or explaining a measure, olive is a proposal, grey is a general statement.
+- **The colours never change their meaning:** {colour_key}.
 - **Filters are on the left** and apply everywhere. Every tab opens with a summary written from
   whatever is currently in view, and closes with the records behind it.
             """
@@ -556,7 +1044,7 @@ with tab_over:
 
     st.markdown("##### How members engaged")
     stance_strip(filtered)
-    note("These four colours mean the same thing in every chart across the dashboard.")
+    note("These colours mean the same thing in every chart across the dashboard.")
 
     area_stance = A.groupby(["Area", "Stance"]).size().reset_index(name="count")
     show(stance_hbar(area_stance, "Area", "Which security areas come up most?", "interventions"),
@@ -574,21 +1062,23 @@ with tab_mem:
     lead("Who takes the floor, how they engage, and whose measures they are talking about.")
 
     counts = filtered["Member"].value_counts()
-    apprehensive = (filtered[filtered["Stance"] == "Apprehension"]["Member"]
+    apprehensive = (filtered[filtered["Stance"].isin(CONCERN_STANCES)]["Member"]
                     .value_counts().reindex(counts.index).fillna(0))
-    defending = (filtered[filtered["Stance"] == "Defence/Explanation"]["Member"]
+    defending = (filtered[filtered["Stance"].isin(DEFENCE_STANCES)]["Member"]
                  .value_counts().reindex(counts.index).fillna(0))
     vocal = counts[counts >= 3]
 
     line = ""
-    if len(vocal):
+    if len(vocal) and apprehensive.sum():
         critics = (apprehensive / counts).reindex(vocal.index).sort_values(ascending=False)
-        defenders = (defending / counts).reindex(vocal.index).sort_values(ascending=False)
         line = (f"Among those speaking at least three times, <b>{critics.index[0]}</b> raises concerns "
                 f"most consistently ({pcs(apprehensive[critics.index[0]], counts[critics.index[0]])} of "
-                f"its interventions), while <b>{defenders.index[0]}</b> spends the most time defending "
-                f"or explaining measures "
-                f"({pcs(defending[defenders.index[0]], counts[defenders.index[0]])}). ")
+                f"its interventions)")
+        if defending.sum():
+            defenders = (defending / counts).reindex(vocal.index).sort_values(ascending=False)
+            line += (f", while <b>{defenders.index[0]}</b> spends the most time defending or explaining "
+                     f"measures ({pcs(defending[defenders.index[0]], counts[defenders.index[0]])})")
+        line += ". "
 
     readout(
         f"<b>{filtered['Member'].nunique()}</b> members speak in this view. "
@@ -602,7 +1092,7 @@ with tab_mem:
                   .groupby(["Member", "Stance"]).size().reset_index(name="count"))
     show(stance_hbar(mem_stance, "Member", "Who speaks most, and how?", "interventions"), "mem_stance")
 
-    pairs = filtered[filtered["Owner"].notna() & ~filtered["Owner"].isin(["Not applicable"])]
+    pairs = filtered[filtered["Owner"].notna() & (filtered["Owner"] != NOT_APPLICABLE)]
     cross = pairs[pairs["Member"] != pairs["Owner"]]
     if len(cross) >= 5:
         pc = (cross.groupby(["Member", "Owner"]).size().reset_index(name="count")
@@ -632,7 +1122,7 @@ with tab_meas:
         g_counts = NAMED["Measure_Group"].value_counts()
         unspec = int((M["Measure"] == UNSPECIFIED).sum())
 
-        contested = (NAMED.assign(app=NAMED["Stance"] == "Apprehension")
+        contested = (NAMED.assign(app=NAMED["Stance"].isin(CONCERN_STANCES))
                      .groupby("Measure").agg(mentions=("Row_ID", "nunique"), concerns=("app", "sum")))
         contested = contested[contested["mentions"] >= CONTEST_FLOOR]
         contested["share"] = (contested["concerns"] / contested["mentions"] * 100).round(1)
@@ -669,17 +1159,17 @@ with tab_meas:
         show(hbar(vc(NAMED["Measure_Group"]), "What kinds of measure are these?", "interventions"),
              "meas_group")
         note("Families are grouped automatically from the measure names — the full mapping is on the "
-             "<b>Records</b> tab.")
+             "<b>Data &amp; method</b> tab.")
 
-        owner_rows = filtered[filtered["Owner"].notna() & ~filtered["Owner"].isin(["Not applicable"])]
+        owner_rows = filtered[filtered["Owner"].notna() & (filtered["Owner"] != NOT_APPLICABLE)]
         if len(owner_rows) >= 5:
             show(stance_hbar(owner_rows.groupby(["Owner", "Stance"]).size().reset_index(name="count"),
                              "Owner", "Whose measures are being discussed?", "interventions"),
                  "meas_owner")
 
         st.markdown("#### Measure summary table")
-        ref = (M.assign(app=M["Stance"] == "Apprehension",
-                        dfd=M["Stance"] == "Defence/Explanation")
+        ref = (M.assign(app=M["Stance"].isin(CONCERN_STANCES),
+                        dfd=M["Stance"].isin(DEFENCE_STANCES))
                .groupby(["Measure_Group", "Measure"])
                .agg(Interventions=("Row_ID", "nunique"), Members=("Member", "nunique"),
                     Concerns=("app", "sum"), Defences=("dfd", "sum"),
@@ -706,22 +1196,45 @@ with tab_args:
         st.info("No argument grounds recorded for these records.")
     else:
         t_counts = T["Topic"].value_counts()
-        legal = T[T["Dimension"] == "Legal"]["Row_ID"].nunique()
+        primary = T[T["Slot"] == 1]
+        avg_grounds = round(len(T) / T["Row_ID"].nunique(), 1)
+
+        legal_line = ""
+        if LEGAL_DIM and (T["Dimension"] == LEGAL_DIM).any():
+            legal = T[T["Dimension"] == LEGAL_DIM]["Row_ID"].nunique()
+            legal_line = (f"<b>{legal}</b> interventions ({pcs(legal, len(filtered))}) argue at least "
+                          f"partly in <b>{LEGAL_DIM.lower()}</b> terms — whether a measure is "
+                          "WTO-consistent, transparent or procedurally fair. ")
+
         readout(
             f"The most common ground of argument is <b>{t_counts.index[0]}</b> "
-            f"({int(t_counts.iloc[0])} interventions). "
-            f"<b>{legal}</b> interventions ({pcs(legal, len(filtered))}) argue at least partly in legal "
-            f"terms — whether a measure is WTO-consistent, transparent or procedurally "
-            f"fair.{small_n(filtered)}"
+            f"({int(t_counts.iloc[0])} interventions). " + legal_line
+            + f"Each intervention is coded on <b>{avg_grounds}</b> grounds on average, up to a "
+              f"maximum of three.{small_n(filtered)}"
         )
 
         show(stance_hbar(T.groupby(["Topic", "Stance"]).size().reset_index(name="count"),
                          "Topic", "What grounds do members argue on?", "interventions"), "arg_topic")
-        note("A member usually argues on more than one ground at once, so an intervention can "
-             "appear in several bars.")
+        note("All three coded grounds count here. A member usually argues on more than one at once, "
+             "so an intervention can appear in several bars.")
+
+        if not primary.empty:
+            show(hbar(vc(primary["Topic"]), "Which ground comes first?", "interventions"), "arg_primary")
+            note("The first-coded ground is the principal one — this chart uses <b>Governance Topic 1</b> "
+                 "only, so each intervention appears exactly once.")
 
         show(hbar(vc(T["Dimension"]), "Grouped into broad dimensions", "interventions", height=320),
              "arg_dim")
+
+        with st.expander("Which topics sit under which dimension?"):
+            pairs_tbl = (T.groupby(["Dimension", "Topic"])
+                         .agg(Interventions=("Row_ID", "nunique"),
+                              **{"As first ground": ("Slot", lambda s: int((s == 1).sum()))})
+                         .reset_index()
+                         .sort_values(["Dimension", "Interventions"], ascending=[True, False]))
+            st.dataframe(pairs_tbl, width="stretch", hide_index=True, height=340)
+            st.download_button("Download this table (CSV)", pairs_tbl.to_csv(index=False),
+                               "governance_topics.csv", "text/csv", key="dl_gov")
 
     records_panel("args", filtered)
 
@@ -733,10 +1246,65 @@ with tab_data:
 
     if not vocab.empty:
         with st.expander("What the terms mean"):
-            st.dataframe(vocab.rename(columns={"Permitted value": "Value"}),
-                         width="stretch", hide_index=True)
+            st.dataframe(vocab, width="stretch", hide_index=True)
             st.download_button("Download the data dictionary (CSV)", vocab.to_csv(index=False),
                                "data_dictionary.csv", "text/csv", key="dl_dict")
+
+    # Which sheet column filled which role. Open this first if a chart looks empty.
+    with st.expander(f"How the workbook was read ({len(COLMAP)} columns matched)"):
+        st.caption(f"Sheets used — data: **{SHEETS['Database']}**; "
+                   f"vocabulary: **{SHEETS['Vocabularies'] or 'none found'}**; "
+                   f"issues log: **{SHEETS['Issues_Log'] or 'none found'}**.")
+        cmap = pd.DataFrame({"Column in the workbook": list(COLMAP),
+                             "Read by the dashboard as": [COLMAP[c] for c in COLMAP]})
+        renamed = [a for a, b in zip(cmap["Column in the workbook"],
+                                     cmap["Read by the dashboard as"]) if norm(a) != norm(b)]
+        st.dataframe(cmap, width="stretch", hide_index=True, height=300)
+        if renamed:
+            st.caption(f"{len(renamed)} column(s) matched under a heading different from the "
+                       "dashboard's own name for the role — that is expected and fine: "
+                       + ", ".join(f"`{c}`" for c in renamed) + ".")
+        if UNUSED_COLS:
+            st.caption("Present in the sheet but not used by any chart: "
+                       + ", ".join(f"`{c}`" for c in UNUSED_COLS) + ".")
+
+    # How the stance values were read, and what colour each one was given.
+    with st.expander("How the stance values were read"):
+        srows = pd.DataFrame({
+            "Stance as written in the workbook": STANCE_ORDER,
+            "Read as": [STANCE_ROLES.get(s) or "not recognised — charted, but counted as neither "
+                                               "a concern nor a defence" for s in STANCE_ORDER],
+            "Records": [int((df["Stance"] == s).sum()) for s in STANCE_ORDER],
+        })
+        st.dataframe(srows, width="stretch", hide_index=True)
+        st.caption("Order comes from the Vocabularies sheet; the colour follows the reading. "
+                   "Concern totals count " + joined(CONCERN_STANCES, 5) + "; defence totals count "
+                   + (joined(DEFENCE_STANCES, 5) if DEFENCE_STANCES else "nothing") + ".")
+
+    # A standing check that the governance labels in the Database still match the
+    # controlled vocabulary. Nothing is corrected here — drift is reported, not hidden.
+    permitted = vocab_pairs(vocab)
+    if permitted and not GOV_ALL.empty:
+        allowed = {(d_, t_) for d_, t_ in permitted}
+        used = (GOV_ALL.groupby(["Dimension", "Topic"]).size()
+                .reset_index(name="Rows").sort_values("Rows", ascending=False))
+        drift = used[[(r.Dimension, r.Topic) not in allowed for r in used.itertuples()]]
+        unused_pairs = [f"{d_}: {t_}" for d_, t_ in permitted
+                        if (d_, t_) not in set(zip(GOV_ALL["Dimension"], GOV_ALL["Topic"]))]
+        label = ("Vocabulary check: governance labels"
+                 + (f" — {len(drift)} to review" if len(drift) else " — clean"))
+        with st.expander(label):
+            if len(drift):
+                st.markdown("**Used in the Database but not listed in the Vocabularies sheet.** "
+                            "These are counted as they stand — the app does not rename them. Either "
+                            "add them to the Vocabularies sheet or map them in `TOPIC_FIXES` at the "
+                            "top of `app.py`.")
+                st.dataframe(drift.rename(columns={"Topic": "Topic as coded"}),
+                             width="stretch", hide_index=True)
+            else:
+                st.success("Every governance label in the Database appears in the Vocabularies sheet.")
+            if unused_pairs:
+                st.caption("Listed as permitted but never used: " + "; ".join(unused_pairs) + ".")
 
     with st.expander("How measures are grouped into families"):
         mapping = (measures_long(df)[["Measure", "Measure_Group"]]
@@ -753,15 +1321,14 @@ with tab_data:
         if "Confidence" in filtered.columns:
             conf = vc(filtered["Confidence"])
             fig = px.pie(conf, names="label", values="count", hole=.55, title="Coder confidence",
-                         color="label",
-                         color_discrete_map={"High": "#5C8A4A", "Medium": "#B0894A", "Low": CONCERN})
+                         color="label", color_discrete_map=CONF_COLORS)
             fig.update_layout(height=300, margin=dict(t=56, b=20, l=10, r=10))
             show(fig, "q_conf", q1)
         if "Security_Relevance" in filtered.columns:
-            core = int((filtered["Security_Relevance"] == "Core").sum())
-            q2.metric("Security is the core issue", pcs(core, len(filtered)),
+            core = int((filtered["Security_Relevance"] == CORE_VALUE).sum())
+            q2.metric(f"Security is the {str(CORE_VALUE).lower()} issue", pcs(core, len(filtered)),
                       help="The rest touch on security as context rather than as the point of the "
-                           "intervention. Filter to Core-only under More filters.")
+                           "intervention. Filter to these records only under More filters.")
             q2.caption(f"{core} of {len(filtered)} records in view.")
 
     if not issues.empty:
@@ -772,7 +1339,7 @@ with tab_data:
 
 st.markdown(
     f"<div class='note' style='margin-top:26px;border-top:1px solid {RULE};padding-top:10px;'>"
-    f"Source: {wb.name} · Scope: {DOMAIN} · Summaries are written from the records in view, not by a "
-    "language model.</div>",
+    f"Source: {wb.name} · Scope: {DOMAIN} · Last updated {LAST_UPDATED} · Summaries are written from "
+    "the records in view, not by a language model.</div>",
     unsafe_allow_html=True,
 )
