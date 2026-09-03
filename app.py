@@ -306,6 +306,7 @@ st.markdown(
       .lead {{ font-size:.92rem; color:{MUTED}; margin:2px 0 16px 0; }}
 
       section[data-testid="stSidebar"] {{ background:#F7F9FA; border-right:1px solid {RULE}; }}
+      footer {{ display:none !important; }}
 
       @media (max-width: 640px) {{
           .block-container {{ padding-left:.7rem; padding-right:.7rem; }}
@@ -1157,8 +1158,6 @@ with tab_meas:
 
         show(hbar(vc(NAMED["Measure_Group"]), "What kinds of measure are these?", "interventions"),
              "meas_group")
-        note("Families are grouped automatically from the measure names — the full mapping is on the "
-             "<b>Data &amp; method</b> tab.")
 
         owner_rows = filtered[filtered["Owner"].notna() & (filtered["Owner"] != NOT_APPLICABLE)]
         if len(owner_rows) >= 5:
@@ -1215,18 +1214,5 @@ with tab_args:
                          "Topic", "What grounds do members argue on?", "interventions"), "arg_topic")
         note("All three coded grounds count here. A member usually argues on more than one at once, "
              "so an intervention can appear in several bars.")
-
-        show(hbar(vc(T["Dimension"]), "Grouped into broad dimensions", "interventions", height=320),
-             "arg_dim")
-
-        with st.expander("Which topics sit under which dimension?"):
-            pairs_tbl = (T.groupby(["Dimension", "Topic"])
-                         .agg(Interventions=("Row_ID", "nunique"),
-                              **{"As first ground": ("Slot", lambda s: int((s == 1).sum()))})
-                         .reset_index()
-                         .sort_values(["Dimension", "Interventions"], ascending=[True, False]))
-            st.dataframe(pairs_tbl, width="stretch", hide_index=True, height=340)
-            st.download_button("Download this table (CSV)", pairs_tbl.to_csv(index=False),
-                               "governance_topics.csv", "text/csv", key="dl_gov")
 
     records_panel("args", filtered)
