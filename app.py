@@ -61,8 +61,6 @@ CONTEST_FLOOR = 3               # minimum mentions before a measure enters the c
 # first and last dates that happen to appear in the rows — edit it when the coverage extends.
 PERIOD_FROM = "01 Jan 2026"
 PERIOD_TO = "15 Aug 2026"
-DOCUMENTS_SCREENED = "135 WTO documents circulated between 1 January 2026 and 15 August 2026"
-DOCUMENTS_COVERED = "23"
 LAST_UPDATED = "06 Sep 2026"    # edit this line whenever the workbook is refreshed
 
 # ---------------------------------------------------------------------------------------
