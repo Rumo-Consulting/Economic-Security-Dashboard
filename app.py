@@ -61,7 +61,7 @@ CONTEST_FLOOR = 3               # minimum mentions before a measure enters the c
 # first and last dates that happen to appear in the rows — edit it when the coverage extends.
 PERIOD_FROM = "01 Jan 2026"
 PERIOD_TO = "15 Aug 2026"
-LAST_UPDATED = "03 Sep 2026"    # edit this line whenever the workbook is refreshed
+LAST_UPDATED = "06 Sep 2026"    # edit this line whenever the workbook is refreshed
 
 # ---------------------------------------------------------------------------------------
 # Colour scheme
@@ -136,9 +136,11 @@ GRID = _P["grid"]
 BAR = _P["bar"]
 CONCERN = _P["concern"]
 
-# Sequential scale for the cross-tab heatmap: starts on the page colour so an empty cell
-# reads as blank paper rather than as a low value.
-HEAT_SCALE = [CANVAS, "#CFDCE0", "#9CBAC4", "#67919F", PRIMARY]
+# Sequential scale for the cross-tab heatmap. On a tinted page this used to start on the
+# page colour itself. On white that makes a zero cell vanish completely and the matrix
+# reads as dark blobs floating with no table around them, so it now starts on the faint
+# surface tint — an empty cell still reads as empty, but the grid keeps its shape.
+HEAT_SCALE = [SURFACE, "#DCE7EB", "#A9C3CB", "#6E97A4", PRIMARY]
 PCONF = {"displayModeBar": False, "responsive": True}
 
 FORUM_SHORT = {
@@ -313,10 +315,20 @@ st.markdown(
       /* The page colour. Set here and in .streamlit/config.toml — the config file colours
          the chrome Streamlit paints before this stylesheet loads, which is what stops the
          white flash on a slow reload. */
-      .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {{
-          background: {CANVAS};
+      .stApp, [data-testid="stAppViewContainer"] {{ background: {CANVAS}; }}
+
+      /* Streamlit's own top bar sits above the masthead. Left alone it paints a hairline
+         straight across the page just above the logo, which then competes with the
+         masthead rule below the title — two lines, neither of them meaning anything.
+         Transparent, no border, no shadow, no blur. The coloured decoration strip
+         Streamlit puts at the very top edge goes too. */
+      [data-testid="stHeader"] {{
+          background: transparent !important;
+          border-bottom: none !important;
+          box-shadow: none !important;
+          backdrop-filter: none !important;
       }}
-      [data-testid="stHeader"] {{ border-bottom: 1px solid {RULE}; }}
+      [data-testid="stDecoration"] {{ display: none !important; }}
 
       /* Anything Streamlit draws as a white panel is brought back to the surface colour,
          so no element floats on a brighter white than the page. */
@@ -381,6 +393,11 @@ st.markdown(
                                       border-radius:8px 8px 0 0; color:{MUTED}; }}
       .stTabs [aria-selected="true"] {{ background:{SURFACE}; color:{PRIMARY};
                                         border-bottom:3px solid {PRIMARY}; }}
+      /* Streamlit draws the sliding underline and the tab-strip baseline as their own
+         elements in its brand red. Styling the tab alone leaves that red bar sitting on
+         top of the teal one — which is what puts a stray red line under "Overview". */
+      .stTabs [data-baseweb="tab-highlight"] {{ background-color:{PRIMARY} !important; }}
+      .stTabs [data-baseweb="tab-border"] {{ background-color:{RULE} !important; }}
 
       .read {{ background:{SURFACE}; border:1px solid {RULE}; border-left:4px solid {PRIMARY};
                border-radius:4px; padding:15px 19px; margin:6px 0 26px 0;
@@ -1098,7 +1115,6 @@ st.markdown(
     f"""
     <div class="masthead">
       {logo_html}
-      <div class="eyebrow">Trade Law Observatory</div>
       <h1>Economic Security Dashboard</h1>
       <div class="sub">How WTO members raise, defend and contest {DOMAIN.lower()} measures in the
       organisation's formal meetings.</div>
