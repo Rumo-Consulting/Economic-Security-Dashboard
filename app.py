@@ -61,7 +61,7 @@ CONTEST_FLOOR = 3               # minimum mentions before a measure enters the c
 # first and last dates that happen to appear in the rows — edit it when the coverage extends.
 PERIOD_FROM = "01 Jan 2026"
 PERIOD_TO = "15 Aug 2026"
-LAST_UPDATED = "06 Sep 2026"    # edit this line whenever the workbook is refreshed
+LAST_UPDATED = "03 Sep 2026"    # edit this line whenever the workbook is refreshed
 
 # ---------------------------------------------------------------------------------------
 # Colour scheme
@@ -70,14 +70,34 @@ LAST_UPDATED = "06 Sep 2026"    # edit this line whenever the workbook is refres
 # background, sidebar, cards, chart paper, gridlines — is drawn from the chosen entry, so
 # no colour is written twice and none of them can drift apart.
 #
+#   white      plain white page, faint grey panels. The neutral default: the ground says
+#              nothing, so the stance colours carry all the meaning on screen.
 #   parchment  warm off-white paper, deep teal ink, ochre accent. Reads like a printed
 #              working paper; the warm ground stops the charts glaring.
 #   slate      cool blue-grey ground, same teal and ochre. Choose this if the logo is
 #              cooler-toned or sits on a blue field.
 #
-PALETTE = "parchment"
+# NOTE ON "white": on a white page a card cannot be made to float by being brighter than
+# the ground, because there is nothing brighter than white. So the relationship is
+# inverted here — surface sits very slightly DARKER than canvas, and the hairline rule
+# does the rest of the work. Do not set surface to #FFFFFF or every readout box, table
+# and selected tab will dissolve into the page.
+#
+PALETTE = "white"
 
 PALETTES: dict[str, dict[str, str]] = {
+    "white": {
+        "canvas":  "#FFFFFF",   # the page itself
+        "surface": "#F6F7F9",   # cards, tables, chart paper — a shade DARKER than canvas
+        "sidebar": "#F1F3F5",
+        "ink":     "#14202B",   # headings and emphasis
+        "primary": "#1F4E5F",   # unchanged house colour, so the logo still belongs
+        "muted":   "#5F6B75",   # captions and notes
+        "rule":    "#E0E4E8",   # hairlines and borders — neutral, not warm
+        "grid":    "#ECEFF2",   # chart gridlines
+        "bar":     "#3A7385",   # neutral single-series bars
+        "concern": "#B0602A",   # the accent, and the concern stance
+    },
     "parchment": {
         "canvas":  "#F2EFE8",   # the page itself
         "surface": "#FBFAF7",   # cards, tables, chart paper
